@@ -1,3 +1,16 @@
+"""Patch-aware image classification head for Tiny-Edit-Guard.
+
+Input:
+    patch_tokens: (B, N, D)
+
+Output:
+    cls_logits:    (B,)    raw image-level logits
+    patch_logits:  (B, N)  raw local edited-region logits
+    topk_indices:  (B, K) or None
+
+The local scorer is shared between Patch Average and Patch Top-k.
+Only the aggregation rule changes.
+"""
 from __future__ import annotations
 
 from typing import Dict, Optional
@@ -7,77 +20,98 @@ import torch.nn as nn
 
 
 class PatchHead(nn.Module):
-    """SegFormer feature map -> patch scores -> image-level logit."""
-
-    SUPPORTED_AGGREGATIONS = {"average", "topk"}
-
     def __init__(
         self,
-        in_channels: int = 256,
-        hidden_dim: int = 128,
-        aggregation: str = "average",
-        topk_ratio: float = 0.1,
+        in_dim: int,
+        aggregation: str = "topk",
+        hidden_dim: int = 256,
         dropout: float = 0.1,
-    ) -> None:
+        topk_ratio: float = 0.10,
+    ):
+        """
+        Args:
+            in_dim: DINOv3 patch-token dimension (= backbone.hidden_size).
+            aggregation: "average" or "topk".
+            hidden_dim: local patch scorer hidden dimension.
+            dropout: dropout probability in the scorer.
+            topk_ratio: fraction of local patch logits used by Top-k aggregation.
+        """
         super().__init__()
 
-        if aggregation not in self.SUPPORTED_AGGREGATIONS:
+        if aggregation not in {"average", "topk"}:
             raise ValueError(
-                f"aggregation must be one of {self.SUPPORTED_AGGREGATIONS}, "
-                f"got {aggregation!r}"
+                f"aggregation must be 'average' or 'topk', got {aggregation!r}"
             )
         if not 0.0 < topk_ratio <= 1.0:
-            raise ValueError("topk_ratio must be in (0, 1].")
+            raise ValueError(f"topk_ratio must be in (0, 1], got {topk_ratio}")
 
         self.aggregation = aggregation
-        self.topk_ratio = topk_ratio
+        self.topk_ratio = float(topk_ratio)
 
-        self.patch_scorer = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_dim, kernel_size=1),
+        self.scorer = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Conv2d(hidden_dim, 1, kernel_size=1),
+            nn.Linear(hidden_dim, 1),
         )
 
-    def forward(
-        self, feature_map: torch.Tensor
-    ) -> Dict[str, Optional[torch.Tensor]]:
-        if feature_map.ndim != 4:
+    def forward(self, patch_tokens: torch.Tensor) -> Dict[str, Optional[torch.Tensor]]:
+        """
+        Args:
+            patch_tokens: (B, N, D)
+
+        Returns:
+            cls_logits:   (B,)
+            patch_logits: (B, N)
+            topk_indices: (B, K) for Top-k, otherwise None
+        """
+        if patch_tokens.dim() != 3:
             raise ValueError(
-                f"feature_map must be [B,C,H,W], got {tuple(feature_map.shape)}"
+                f"patch_tokens must have shape (B, N, D), got {tuple(patch_tokens.shape)}"
             )
 
-        score_map = self.patch_scorer(feature_map)   # [B,1,H,W]
-        patch_scores = score_map.flatten(1)          # [B,H*W]
+        patch_logits = self.scorer(patch_tokens).squeeze(-1)  # (B, N)
 
-        topk_indices = None
         if self.aggregation == "average":
-            image_logits = patch_scores.mean(dim=1)
+            cls_logits = patch_logits.mean(dim=1)
+            topk_indices = None
         else:
-            num_patches = patch_scores.shape[1]
-            k = max(1, round(num_patches * self.topk_ratio))
-            k = min(k, num_patches)
+            n_patches = patch_logits.shape[1]
+            k = max(1, int(round(n_patches * self.topk_ratio)))
+            k = min(k, n_patches)
 
-            topk_scores, topk_indices = torch.topk(
-                patch_scores, k=k, dim=1, largest=True, sorted=True
+            topk = torch.topk(
+                patch_logits,
+                k=k,
+                dim=1,
+                largest=True,
+                sorted=True,
             )
-            image_logits = topk_scores.mean(dim=1)
+            cls_logits = topk.values.mean(dim=1)
+            topk_indices = topk.indices
 
         return {
-            "logits": image_logits,
-            "patch_scores": patch_scores,
-            "score_map": score_map,
+            "cls_logits": cls_logits,
+            "patch_logits": patch_logits,
             "topk_indices": topk_indices,
         }
 
 
 if __name__ == "__main__":
-    x = torch.randn(4, 256, 16, 16)
+    # DINOv3 ViT-S/16 + 512x512 example:
+    # 32 x 32 = 1024 patches. hidden size is read from the backbone in real use.
+    x = torch.randn(4, 1024, 384)
 
-    for mode in ("average", "topk"):
-        head = PatchHead(aggregation=mode, topk_ratio=0.1)
+    for aggregation in ("average", "topk"):
+        head = PatchHead(
+            in_dim=384,
+            aggregation=aggregation,
+            topk_ratio=0.10,
+        )
         out = head(x)
-        print(mode)
-        print("logits:", out["logits"].shape)
-        print("patch_scores:", out["patch_scores"].shape)
-        print("score_map:", out["score_map"].shape)
+        print(f"[{aggregation}]")
+        print(" cls_logits:  ", tuple(out["cls_logits"].shape))
+        print(" patch_logits:", tuple(out["patch_logits"].shape))
+        if out["topk_indices"] is not None:
+            print(" topk_indices:", tuple(out["topk_indices"].shape))
