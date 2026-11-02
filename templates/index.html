@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tiny-Edit-Guard</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      Tiny-Edit-Guard
+      <span class="brand-sub">AI 편집 이미지 탐지</span>
+    </div>
+    <div class="model-chip" id="modelChip">모델 불러오는 중…</div>
+  </header>
+
+  <div class="demo-banner" id="demoBanner" hidden>
+    데모 모드입니다. 화면 확인용 가짜 결과이며 실제 모델 예측이 아닙니다.
+    <code>python app.py --checkpoint runs/…/best.pt</code> 로 실행하세요.
+  </div>
+
+  <main class="layout">
+    <!-- ===== 왼쪽: 입력 ===== -->
+    <aside class="card sidebar">
+      <h2>입력 이미지</h2>
+      <p class="muted">이미지를 업로드하세요.</p>
+
+      <label class="dropzone" id="dropzone" tabindex="0">
+        <input type="file" id="fileInput" accept="image/jpeg,image/png,image/webp" hidden>
+        <svg class="dz-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="3" y="3" width="18" height="18" rx="3"/>
+          <circle cx="8.5" cy="8.5" r="1.8"/>
+          <path d="M21 15l-5-5L5 21"/>
+        </svg>
+        <span class="dz-title">클릭하거나 이미지를 드래그하세요</span>
+        <span class="dz-sub">(JPG / PNG)</span>
+      </label>
+
+      <h3 class="examples-title">예시 이미지</h3>
+      <div class="examples" id="examples"></div>
+      <p class="muted small" id="examplesEmpty" hidden>
+        <code>static/examples/</code> 폴더에 이미지를 넣으면 여기에 표시됩니다.
+      </p>
+    </aside>
+
+    <!-- ===== 오른쪽 상단: 원본 + 탐지 결과 ===== -->
+    <section class="card original">
+      <h2>원본 이미지</h2>
+      <div class="viewer" id="originalViewer">
+        <div class="placeholder">왼쪽에서 이미지를 선택하세요</div>
+      </div>
+    </section>
+
+    <section class="card result">
+      <h2>탐지 결과</h2>
+      <div class="result-table">
+        <div class="row">
+          <span class="row-label">판단 결과</span>
+          <span class="row-value"><span class="badge badge-empty" id="verdict">—</span></span>
+        </div>
+        <div class="row">
+          <span class="row-label">편집 확률</span>
+          <span class="row-value strong" id="probability">—</span>
+        </div>
+        <div class="row row-ratio">
+          <span class="row-label">예측된 편집 영역 비율</span>
+          <div class="row-value">
+            <span class="strong" id="ratio">—</span>
+            <div class="bar-line">
+              <div class="bar"><div class="bar-fill" id="ratioBar"></div></div>
+              <span class="bar-range">(0 ~ 100%)</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="notice" id="notice">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="10"/><rect x="9" y="8.5" width="2" height="6" rx="1" fill="#fff"/><circle cx="10" cy="5.8" r="1.2" fill="#fff"/></svg>
+        <div>
+          <p id="noticeMain">이미지를 올리면 AI 편집 여부와 편집 위치를 분석합니다.</p>
+          <p class="notice-sub" id="noticeSub">작은 영역의 편집도 탐지할 수 있습니다.</p>
+        </div>
+      </div>
+      <div class="meta" id="meta"></div>
+    </section>
+
+    <!-- ===== 하단: 위치 탐지 결과 ===== -->
+    <section class="card location">
+      <h2>위치 탐지 결과</h2>
+      <div class="loc-grid">
+        <figure class="panel">
+          <figcaption>예측된 편집 영역 마스크</figcaption>
+          <div class="viewer dark" id="maskViewer"><div class="placeholder">—</div></div>
+        </figure>
+        <figure class="panel">
+          <figcaption>원본 이미지 + 예측 영역 (Overlay)</figcaption>
+          <div class="viewer" id="overlayViewer"><div class="placeholder">—</div></div>
+        </figure>
+        <figure class="panel">
+          <figcaption>편집 영역만 추출 (확대)</figcaption>
+          <div class="viewer" id="cropViewer"><div class="placeholder">—</div></div>
+        </figure>
+      </div>
+    </section>
+  </main>
+
+  <div class="loading" id="loading" hidden>
+    <div class="spinner"></div>
+    <span>분석 중…</span>
+  </div>
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
