@@ -1,9 +1,14 @@
 """Generic trainer for GlobalBaseline / SegFormerBaseline / PatchGuard.
 
 Batch format (dict from the DataLoader):
-    "pixel_values": (B, 3, H, W) float, ImageNet-normalized
-    "label":        (B,) float, 1 = edited, 0 = real
+    "pixel_values": (B, 3, H, W) float, ImageNet-normalized   ("image" is also accepted)
+    "label":        (B,) int/float, 1 = edited, 0 = real
     "mask":         (B, 1, H, W) or (B, H, W) float in {0, 1}   [optional, for localization]
+    "valid_mask":   (B,) bool   [optional; False = invalid/empty GT on an edited sample ->
+                                 excluded from mask loss and localization metrics. Real images
+                                 with empty masks are valid.]
+    any other per-sample fields (e.g. "actual_mask_ratio", "method", "id") are passed through
+    to `Trainer.predict()` CSV output for Tiny Edit / Unseen Method analysis.
 
 Model output format (dict):
     "cls_logits":   (B,)            [required]
@@ -14,6 +19,7 @@ Loss: pass `loss_fn(outputs, batch) -> (loss, {name: float})`. losses.py can be 
 """
 from __future__ import annotations
 
+import csv
 import json
 import math
 import time
@@ -24,7 +30,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import get_cosine_schedule_with_warmup
+from transformers import get_cosine_schedule_with_warmup, set_seed
+
+# Old metric names -> current names, so existing --monitor values keep selecting best.pt.
+METRIC_ALIASES = {"auc": "auroc", "pixel_f1": "pixel_dice", "image_mean_f1": "image_mean_dice"}
 
 LossFn = Callable[[Dict[str, torch.Tensor], Dict[str, torch.Tensor]], Tuple[torch.Tensor, Dict[str, float]]]
 
@@ -32,10 +41,11 @@ LossFn = Callable[[Dict[str, torch.Tensor], Dict[str, torch.Tensor]], Tuple[torc
 # ----------------------------------------------------------------------------- loss
 
 def dice_loss(logits: torch.Tensor, target: torch.Tensor, eps: float = 1.0) -> torch.Tensor:
+    """Per-sample soft Dice loss, shape (B,)."""
     prob = logits.sigmoid().flatten(1)
     target = target.flatten(1)
     inter = (prob * target).sum(1)
-    return (1 - (2 * inter + eps) / (prob.sum(1) + target.sum(1) + eps)).mean()
+    return 1 - (2 * inter + eps) / (prob.sum(1) + target.sum(1) + eps)
 
 
 def default_loss(outputs, batch, mask_weight: float = 1.0):
@@ -44,11 +54,14 @@ def default_loss(outputs, batch, mask_weight: float = 1.0):
     logs["loss_cls"] = loss.item()
 
     if "mask_logits" in outputs and "mask" in batch:
-        mask = _as_mask(batch["mask"])
-        m_logits = outputs["mask_logits"]
-        loss_mask = F.binary_cross_entropy_with_logits(m_logits, mask) + dice_loss(m_logits, mask)
-        logs["loss_mask"] = loss_mask.item()
-        loss = loss + mask_weight * loss_mask
+        valid = mask_valid(batch)
+        if valid.any():
+            mask = _as_mask(batch["mask"])[valid]
+            m_logits = outputs["mask_logits"][valid]
+            bce = F.binary_cross_entropy_with_logits(m_logits, mask, reduction="none").flatten(1).mean(1)
+            loss_mask = (bce + dice_loss(m_logits, mask)).mean()
+            logs["loss_mask"] = loss_mask.item()
+            loss = loss + mask_weight * loss_mask
 
     logs["loss"] = loss.item()
     return loss, logs
@@ -56,6 +69,17 @@ def default_loss(outputs, batch, mask_weight: float = 1.0):
 
 def _as_mask(mask: torch.Tensor) -> torch.Tensor:
     return (mask.unsqueeze(1) if mask.dim() == 3 else mask).float()
+
+
+def pixel_values(batch) -> torch.Tensor:
+    """data/dataloader_hf.py yields "pixel_values"; data/14_build_dataloader.py yields "image"."""
+    return batch["pixel_values"] if "pixel_values" in batch else batch["image"]
+
+
+def mask_valid(batch) -> torch.Tensor:
+    if "valid_mask" in batch:
+        return batch["valid_mask"].bool()
+    return torch.ones_like(batch["label"], dtype=torch.bool)
 
 
 # ----------------------------------------------------------------------------- metrics
@@ -81,12 +105,41 @@ def binary_auc(scores: torch.Tensor, labels: torch.Tensor) -> float:
     return float((ranks[labels].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
 
 
+def average_precision(scores: torch.Tensor, labels: torch.Tensor) -> float:
+    """AUPRC as average precision (sklearn-style step interpolation)."""
+    labels = labels.bool()
+    n_pos = int(labels.sum())
+    if n_pos == 0:
+        return float("nan")
+    order = scores.argsort(descending=True)
+    hits = labels[order].double()
+    precision = hits.cumsum(0) / torch.arange(1, len(hits) + 1, dtype=torch.float64)
+    return float((precision * hits).sum() / n_pos)
+
+
+def binned_average_precision(pos_hist: torch.Tensor, neg_hist: torch.Tensor) -> float:
+    """AP from per-bin positive/negative counts (bins in ascending score order).
+    Used for pixel AUPRC, where storing every pixel score is too large."""
+    tp = pos_hist.flip(0).cumsum(0)
+    fp = neg_hist.flip(0).cumsum(0)
+    n_pos = tp[-1]
+    if n_pos == 0:
+        return float("nan")
+    precision = tp / (tp + fp).clamp(min=1)
+    recall_step = pos_hist.flip(0) / n_pos
+    return float((precision * recall_step).sum())
+
+
 class MetricTracker:
-    def __init__(self, threshold: float = 0.5):
+    def __init__(self, threshold: float = 0.5, pixel_bins: int = 1000):
         self.threshold = threshold
         self.scores, self.labels = [], []
         self.tp = self.fp = self.fn = 0.0
-        self.per_image_f1 = []
+        self.per_image_dice = []
+        self.per_image_f1 = self.per_image_dice  # old name; subclasses that append here still count
+        self.pixel_bins = pixel_bins
+        self.pos_hist = torch.zeros(pixel_bins, dtype=torch.float64)
+        self.neg_hist = torch.zeros(pixel_bins, dtype=torch.float64)
         self.has_mask = False
 
     @torch.no_grad()
@@ -95,19 +148,28 @@ class MetricTracker:
         self.labels.append(batch["label"].float().cpu())
 
         if "mask_logits" in outputs and "mask" in batch:
+            valid = mask_valid(batch)
+            if not valid.any():
+                return
             self.has_mask = True
-            pred = (outputs["mask_logits"].sigmoid() > self.threshold).float()
-            gt = _as_mask(batch["mask"])
+            prob = outputs["mask_logits"][valid].sigmoid()
+            gt = _as_mask(batch["mask"])[valid]
+            pred = (prob > self.threshold).float()
             tp = (pred * gt).flatten(1).sum(1)
             fp = (pred * (1 - gt)).flatten(1).sum(1)
             fn = ((1 - pred) * gt).flatten(1).sum(1)
             self.tp += tp.sum().item()
             self.fp += fp.sum().item()
             self.fn += fn.sum().item()
-            # per-image F1 only on edited images (real images have empty GT masks)
-            edited = batch["label"].bool()
-            f1 = 2 * tp / (2 * tp + fp + fn).clamp(min=1e-8)
-            self.per_image_f1.extend(f1[edited].cpu().tolist())
+            # per-image Dice only on edited images (real images have empty GT masks)
+            edited = batch["label"][valid].bool()
+            dice = 2 * tp / (2 * tp + fp + fn).clamp(min=1e-8)
+            self.per_image_dice.extend(dice[edited].cpu().tolist())
+
+            bins = (prob.flatten() * self.pixel_bins).long().clamp(max=self.pixel_bins - 1)
+            gt_flat = gt.flatten().bool()
+            self.pos_hist += torch.bincount(bins[gt_flat], minlength=self.pixel_bins).double().cpu()
+            self.neg_hist += torch.bincount(bins[~gt_flat], minlength=self.pixel_bins).double().cpu()
 
     def compute(self) -> Dict[str, float]:
         scores, labels = torch.cat(self.scores), torch.cat(self.labels)
@@ -116,15 +178,18 @@ class MetricTracker:
         fp = (pred * (1 - labels)).sum().item()
         fn = ((1 - pred) * labels).sum().item()
         m = {
-            "acc": (pred == labels).float().mean().item(),
+            "auroc": binary_auc(scores, labels),
+            "auprc": average_precision(scores, labels),
             "f1": 2 * tp / max(2 * tp + fp + fn, 1e-8),
-            "auc": binary_auc(scores, labels),
+            "acc": (pred == labels).float().mean().item(),
         }
         if self.has_mask:
-            m["pixel_f1"] = 2 * self.tp / max(2 * self.tp + self.fp + self.fn, 1e-8)
+            if self.pos_hist.sum() > 0:  # empty when a subclass overrides update() without filling it
+                m["pixel_auprc"] = binned_average_precision(self.pos_hist, self.neg_hist)
+            m["pixel_dice"] = 2 * self.tp / max(2 * self.tp + self.fp + self.fn, 1e-8)
             m["pixel_iou"] = self.tp / max(self.tp + self.fp + self.fn, 1e-8)
-            if self.per_image_f1:
-                m["image_mean_f1"] = sum(self.per_image_f1) / len(self.per_image_f1)
+            if self.per_image_dice:
+                m["image_mean_dice"] = sum(self.per_image_dice) / len(self.per_image_dice)
         return m
 
 
@@ -153,18 +218,23 @@ class Trainer:
         warmup_ratio: float = 0.05,
         grad_clip: float = 1.0,
         amp: bool = True,
-        monitor: str = "auc",
+        monitor: str = "auroc",
         monitor_mode: str = "max",
         output_dir: str = "checkpoints/run",
         log_every: int = 50,
+        seed: Optional[int] = None,
         device: Optional[torch.device] = None,
     ):
         """
         Args:
             backbone_prefixes: parameter-name prefixes trained with `backbone_lr` (pretrained
                 encoders); everything else (heads/decoders) uses `lr`. Frozen params are skipped.
-            monitor: validation metric used to pick `best.pt` (e.g. "auc" for V1, "pixel_f1" for V2).
+            monitor: validation metric used to pick `best.pt` (e.g. "auroc" for V1, "pixel_dice" for V2).
+            seed: re-seeds RNGs here (DataLoader shuffle, dropout). Also call `set_seed(seed)`
+                before building the model so head initialization is reproducible.
         """
+        if seed is not None:
+            set_seed(seed)
         self.device = device or auto_device()
         self.model = model.to(self.device)
         self.train_loader = train_loader
@@ -172,7 +242,7 @@ class Trainer:
         self.loss_fn = loss_fn or default_loss
         self.epochs = epochs
         self.grad_clip = grad_clip
-        self.monitor = monitor
+        self.monitor = METRIC_ALIASES.get(monitor, monitor)
         self.monitor_mode = monitor_mode
         self.log_every = log_every
         self.output_dir = Path(output_dir)
@@ -220,7 +290,7 @@ class Trainer:
 
     def _forward(self, batch):
         with torch.autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-            outputs = self.model(batch["pixel_values"])
+            outputs = self.model(pixel_values(batch))
         # losses / metrics in fp32
         return {k: v.float() if torch.is_tensor(v) else v for k, v in outputs.items()}
 
@@ -321,3 +391,54 @@ class Trainer:
             self.global_step = ckpt["global_step"]
             self.best = ckpt["best"]
         print(f"[trainer] loaded {path} (epoch {ckpt['epoch']}, best {ckpt['best']:.4f})")
+
+    # ------------------------------------------------------------------ per-sample predictions
+
+    @torch.no_grad()
+    def predict(self, loader: DataLoader, csv_path: Optional[str] = None, threshold: float = 0.5):
+        """Per-sample results for subset analysis (Tiny Edit bins, Unseen Method, robustness).
+
+        Each row: edit_probability, label, [predicted_edit_ratio, sample_dice, sample_iou]
+        plus any per-sample batch fields (actual_mask_ratio, method, id, ...).
+        """
+        self.model.eval()
+        skip = {"pixel_values", "image", "mask"}
+        rows = []
+        for batch in loader:
+            batch = self._to_device(batch)
+            outputs = self._forward(batch)
+            B = pixel_values(batch).shape[0]
+            cols = {
+                "edit_probability": outputs["cls_logits"].sigmoid().cpu().tolist(),
+                "label": batch["label"].cpu().tolist(),
+            }
+            if "mask_logits" in outputs:
+                pred = (outputs["mask_logits"].sigmoid() > threshold).float()
+                cols["predicted_edit_ratio"] = pred.flatten(1).mean(1).cpu().tolist()
+                if "mask" in batch:
+                    gt = _as_mask(batch["mask"])
+                    tp = (pred * gt).flatten(1).sum(1)
+                    fp = (pred * (1 - gt)).flatten(1).sum(1)
+                    fn = ((1 - pred) * gt).flatten(1).sum(1)
+                    valid = mask_valid(batch)
+                    dice = torch.where(valid, 2 * tp / (2 * tp + fp + fn).clamp(min=1e-8), torch.nan)
+                    iou = torch.where(valid, tp / (tp + fp + fn).clamp(min=1e-8), torch.nan)
+                    cols["sample_dice"] = dice.cpu().tolist()
+                    cols["sample_iou"] = iou.cpu().tolist()
+            for k, v in batch.items():
+                if k in skip or k in cols:
+                    continue
+                if torch.is_tensor(v) and v.dim() == 1 and len(v) == B:
+                    cols[k] = v.cpu().tolist()
+                elif isinstance(v, (list, tuple)) and len(v) == B:
+                    cols[k] = list(v)
+            rows.extend(dict(zip(cols, vals)) for vals in zip(*cols.values()))
+
+        if csv_path:
+            Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(rows)
+            print(f"[trainer] wrote {len(rows)} predictions to {csv_path}")
+        return rows
