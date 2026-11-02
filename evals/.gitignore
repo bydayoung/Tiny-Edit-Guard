@@ -1,0 +1,6 @@
+# 생성 산출물은 커밋하지 않음 (predict.py / evaluate.py가 재생성 가능)
+preds/
+results/
+mlruns/
+__pycache__/
+*.pyc
