@@ -1,0 +1,21 @@
+name: evals smoke test
+
+# 평가 파이프라인이 조용히 깨지는 걸 막는 회귀 테스트.
+# evals/ 또는 공통 지표 코드가 바뀐 PR/push에서 자동 실행된다. (GPU/torch 불필요)
+
+on:
+  push:
+    paths: ["evals/**"]
+  pull_request:
+    paths: ["evals/**"]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy pandas scikit-learn pillow
+      - run: python3 evals/tests/test_smoke.py
