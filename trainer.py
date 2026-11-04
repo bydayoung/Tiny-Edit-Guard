@@ -434,7 +434,7 @@ class Trainer:
                     cols[k] = list(v)
             rows.extend(dict(zip(cols, vals)) for vals in zip(*cols.values()))
 
-        if csv_path:
+        if csv_path and rows:
             Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
             with open(csv_path, "w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
@@ -442,3 +442,22 @@ class Trainer:
                 writer.writerows(rows)
             print(f"[trainer] wrote {len(rows)} predictions to {csv_path}")
         return rows
+
+    def export_predictions(self, loaders: Dict[str, Iterable], checkpoint: str = "best.pt") -> Dict[str, Path]:
+        """After fit(): reload `checkpoint` and write <output_dir>/preds_<split>.csv per loader.
+
+        These CSVs are the input of `evals/evaluate.py --trainer-csv` (val CSV picks the threshold):
+            python3 evals/evaluate.py --trainer-csv <out>/preds_val.csv
+            python3 evals/evaluate.py --trainer-csv <out>/preds_test.csv --val-csv <out>/preds_val.csv --eval-split test
+        """
+        ckpt = self.output_dir / checkpoint
+        if not ckpt.exists():  # best.pt is never written if the monitor metric was always NaN
+            print(f"[trainer] {ckpt.name} not found, using last.pt")
+            ckpt = self.output_dir / "last.pt"
+        self.load(str(ckpt), weights_only=True)
+
+        paths = {}
+        for split, loader in loaders.items():
+            paths[split] = self.output_dir / f"preds_{split}.csv"
+            self.predict(loader, str(paths[split]))
+        return paths

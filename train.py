@@ -291,6 +291,8 @@ def parse_args():
     # Smoke-test / debugging
     p.add_argument("--max-train-batches", type=int, default=None)
     p.add_argument("--max-val-batches", type=int, default=None)
+    p.add_argument("--skip-predict", action="store_true",
+                   help="skip writing preds_val.csv / preds_test.csv after training")
     p.add_argument("--log-every", type=int, default=50)
 
     return p.parse_args()
@@ -380,6 +382,14 @@ def main():
 
     # 5) Train.
     final_metrics = trainer.fit()
+
+    # 6) Per-sample predictions from best.pt -> evals/evaluate.py --trainer-csv.
+    #    Full val/test loaders (real + edited), so classification metrics are complete.
+    if not args.skip_predict:
+        trainer.export_predictions({
+            "val": LoaderAdapter(data_module.val_loader, max_batches=args.max_val_batches),
+            "test": LoaderAdapter(data_module.test_loader, max_batches=args.max_val_batches),
+        })
 
     print("=" * 72)
     print("Training complete")
