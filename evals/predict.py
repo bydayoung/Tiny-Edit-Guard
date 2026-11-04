@@ -2,7 +2,7 @@
 
 팀 코드는 한 줄도 수정하지 않고 import만 한다. 레포 루트 기준 실행 예:
 
-  python3 tinyedit_eval/predict.py \
+  python3 evals/predict.py \
       --model patchguard_topk \
       --checkpoint runs/pg_topk/best.pt \
       --metadata data/final_split_metadata.csv \
@@ -79,7 +79,7 @@ def build_model(kind: str, repo_root: Path):
         from models.segformer_baseline import SegFormerBaseline
         return SegFormerBaseline()
     if kind in ("patchguard_avg", "patchguard_topk"):
-        from patchguard import PatchGuard
+        from models.patchguard import PatchGuard
         agg = "average" if kind.endswith("avg") else "topk"
         return PatchGuard(DinoBackbone(), aggregation=agg)
     raise ValueError(f"unknown model kind: {kind}")
