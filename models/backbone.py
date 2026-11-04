@@ -78,4 +78,5 @@ def to_feature_map(feats: Dict[str, torch.Tensor]) -> torch.Tensor:
     h, w = feats["grid_size"]
     tokens = feats["patch_tokens"]
     B, N, D = tokens.shape
-    return tokens.transpose(1, 2).reshape(B, D, h, w)
+    # contiguous(): the transposed view can make CPU conv2d fail ("view size is not compatible")
+    return tokens.transpose(1, 2).reshape(B, D, h, w).contiguous()
