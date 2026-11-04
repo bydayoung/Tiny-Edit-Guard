@@ -1,2 +1,23 @@
+# 설치: pip install -r requirements.txt
+# torch는 연구실 PC의 CUDA 버전에 맞는 빌드를 먼저 설치 권장 (https://pytorch.org/get-started/locally/)
+
+# 모델 / 학습
 torch>=2.1
-transformers>=4.56  # DINOv3 support
+torchvision                    # data/14_build_dataloader.py, evals/predict.py
+transformers>=4.56,<5          # DINOv3 지원은 4.56부터, 4.57로 테스트함
+huggingface_hub<1.0            # transformers 4.x는 hub 1.x와 호환 안 됨
+datasets                       # data/dataloader_hf.py (HF에서 데이터 로드)
+
+# 데이터 / 평가
+numpy
+pandas
+pillow
+scikit-learn                   # evals/metrics.py
+matplotlib                     # evals/plot_curves.py
+
+# 웹 데모 (app.py)
+flask
+scipy                          # 편집 영역 박스 계산 (없으면 박스 1개로 대체)
+
+# 선택: 실험 기록 (evals/evaluate.py --mlflow)
+# mlflow
