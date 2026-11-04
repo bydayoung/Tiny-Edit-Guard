@@ -17,12 +17,12 @@
 
 사용 예 (레포 루트에서)
   # A) trainer CSV 모드 — 개발 중 val 채점
-  python3 evals/evaluate.py --trainer-csv preds/pg_topk_val.csv --mlflow
+  python3 evals/evaluate.py --trainer-csv preds/pg_topk_val.csv            # MLflow 자동 기록(기본)
   # A) 최종 test 채점 (val CSV로 threshold 선정)
-  python3 evals/evaluate.py --trainer-csv preds/pg_topk_test.csv --val-csv preds/pg_topk_val.csv \
-      --eval-split test --mlflow
+  python3 evals/evaluate.py --trainer-csv preds/pg_topk_test.csv --val-csv preds/pg_topk_val.csv --eval-split test
+  python3 evals/evaluate.py --trainer-csv preds/pg_topk_val.csv --no-mlflow   # 기록 끄기
   # B) predict.py 산출물 모드 (Pixel AUPRC + latency 포함)
-  python3 evals/evaluate.py --pred-dir preds/pg_topk_s0 --mlflow
+  python3 evals/evaluate.py --pred-dir preds/pg_topk_s0
 """
 import argparse
 import json
@@ -162,7 +162,9 @@ def main():
     ap.add_argument("--tag", default="original",
                     help="평가 조건 (original / jpeg_q75 / resize_0.5 / unseen_glide 등)")
     ap.add_argument("--out-dir", default=str(BASE / "results"))
-    ap.add_argument("--mlflow", action="store_true", help="MLflow에 기록")
+    ap.add_argument("--no-mlflow", dest="mlflow", action="store_false",
+                    help="MLflow 기록 끄기 (기본은 항상 기록)")
+    ap.set_defaults(mlflow=True)
     args = ap.parse_args()
 
     run_meta = {}
@@ -240,7 +242,8 @@ def main():
         try:
             import mlflow
         except ImportError:
-            print("[warn] mlflow 미설치 — `pip install mlflow` 후 다시 실행")
+            print("[info] mlflow 미설치 — 기록만 건너뜀 (결과 CSV는 정상 저장됨). "
+                  "기록하려면 `pip install mlflow`")
             return
         mlflow.set_experiment("tinyedit-guard-eval")
         with mlflow.start_run(run_name=f"{run_name}__{args.tag}__{args.eval_split}"):

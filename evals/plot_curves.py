@@ -18,6 +18,14 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
+
+# 한글 깨짐 방지 (맥: AppleGothic, 리눅스/CI엔 없을 수 있어 fallback)
+for _f in ["AppleGothic", "NanumGothic", "Malgun Gothic", "DejaVu Sans"]:
+    try:
+        plt.rcParams["font.family"] = _f; break
+    except Exception:
+        continue
+plt.rcParams["axes.unicode_minus"] = False
 import pandas as pd  # noqa: E402
 
 # 편집 크기 순서 (작은 → 큰). 팀 binning에 맞춰 조정.
