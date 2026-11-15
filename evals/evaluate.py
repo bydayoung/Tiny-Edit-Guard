@@ -104,6 +104,8 @@ def loc_row(scope, vals):
 
 def loc_from_csv(fakes):
     """trainer CSV 모드: sample_dice/sample_iou(이미 계산됨)를 bin별 평균. Pixel AUPRC는 없음."""
+    if "sample_dice" not in fakes.columns:
+        return []  # 분류 전용 모델(Global 등) — localization 출력 없음
     valid = fakes[to_bool(fakes.valid_mask)] if "valid_mask" in fakes.columns else fakes
     valid = valid.dropna(subset=["sample_dice"])
     if not len(valid):
