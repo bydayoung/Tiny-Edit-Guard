@@ -1,0 +1,6 @@
+run,tag,scope,n,dice,iou,pixel_auprc
+segformer,original,loc_overall,545,0.3162,0.2294,
+segformer,original,loc_bin:large,305,0.3991,0.2971,
+segformer,original,loc_bin:medium,86,0.3468,0.2443,
+segformer,original,loc_bin:small,60,0.1901,0.1279,
+segformer,original,loc_bin:tiny,94,0.0998,0.0607,

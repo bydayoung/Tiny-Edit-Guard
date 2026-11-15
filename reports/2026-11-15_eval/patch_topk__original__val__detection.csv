@@ -1,0 +1,13 @@
+run,tag,scope,n_fake,n_real,auroc,auroc_ci_low,auroc_ci_high,auprc,f1,note
+patch_topk,original,val_overall,635,557,0.8397,0.8172,0.8608,0.8443,0.7608,
+patch_topk,original,bin:invalid_mask,90,557,0.6678,0.6245,0.7116,0.1853,0.1912,bin fake vs all real
+patch_topk,original,bin:large,305,557,0.8947,0.8737,0.9151,0.8259,0.7496,bin fake vs all real
+patch_topk,original,bin:medium,86,557,0.8558,0.8129,0.8937,0.4888,0.4778,bin fake vs all real
+patch_topk,original,bin:small,60,557,0.7955,0.7362,0.8484,0.2665,0.3445,bin fake vs all real
+patch_topk,original,bin:tiny,94,557,0.8394,0.8016,0.8767,0.4268,0.4852,bin fake vs all real
+patch_topk,original,method:Flux.1,137,557,0.866,0.8367,0.8944,0.5789,0.5949,method fake vs all real
+patch_topk,original,method:GLIDE,95,557,0.8547,0.8102,0.8977,0.6466,0.4837,method fake vs all real
+patch_topk,original,method:SD1.5,160,557,0.8743,0.8421,0.9025,0.6945,0.6154,method fake vs all real
+patch_topk,original,method:SDXL,152,557,0.8719,0.843,0.8987,0.6148,0.6106,method fake vs all real
+patch_topk,original,method:brushnet_sd1-5,1,557,0.8303,0.7962,0.86,0.0104,0.0144,method fake vs all real
+patch_topk,original,method:flux1dev,90,557,0.6678,0.6245,0.7116,0.1853,0.1912,method fake vs all real

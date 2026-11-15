@@ -1,0 +1,6 @@
+run,tag,scope,n,dice,iou,pixel_auprc
+patch_topk,original,loc_overall,545,0.4129,0.3252,
+patch_topk,original,loc_bin:large,305,0.5195,0.4211,
+patch_topk,original,loc_bin:medium,86,0.4263,0.3253,
+patch_topk,original,loc_bin:small,60,0.2458,0.1706,
+patch_topk,original,loc_bin:tiny,94,0.1615,0.1124,

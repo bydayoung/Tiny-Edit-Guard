@@ -1,0 +1,13 @@
+run,tag,scope,n_fake,n_real,auroc,auroc_ci_low,auroc_ci_high,auprc,f1,note
+segformer,original,val_overall,635,557,0.8718,0.8511,0.8924,0.8741,0.8183,
+segformer,original,bin:invalid_mask,90,557,0.6744,0.6232,0.7266,0.1999,0.3604,bin fake vs all real
+segformer,original,bin:large,305,557,0.9212,0.9025,0.9385,0.8553,0.7703,bin fake vs all real
+segformer,original,bin:medium,86,557,0.9058,0.8747,0.9332,0.5969,0.5049,bin fake vs all real
+segformer,original,bin:small,60,557,0.8569,0.8136,0.9007,0.4045,0.384,bin fake vs all real
+segformer,original,bin:tiny,94,557,0.8787,0.848,0.9052,0.4966,0.5157,bin fake vs all real
+segformer,original,method:Flux.1,137,557,0.9161,0.8923,0.9372,0.7203,0.629,method fake vs all real
+segformer,original,method:GLIDE,95,557,0.9023,0.8681,0.9364,0.7022,0.5047,method fake vs all real
+segformer,original,method:SD1.5,160,557,0.9036,0.8795,0.925,0.7067,0.6427,method fake vs all real
+segformer,original,method:SDXL,152,557,0.9015,0.8778,0.924,0.6663,0.6326,method fake vs all real
+segformer,original,method:brushnet_sd1-5,1,557,0.0467,0.0305,0.0646,0.0019,0.0,method fake vs all real
+segformer,original,method:flux1dev,90,557,0.6744,0.6232,0.7266,0.1999,0.3604,method fake vs all real
