@@ -53,11 +53,17 @@ class DinoBackbone(nn.Module):
         for p in self.model.parameters():
             p.requires_grad = not freeze
         if freeze and unfreeze_last_n > 0:
-            for block in self.model.layer[-unfreeze_last_n:]:
+            for block in self._blocks()[-unfreeze_last_n:]:
                 for p in block.parameters():
                     p.requires_grad = True
             for p in self.model.norm.parameters():
                 p.requires_grad = True
+
+    def _blocks(self) -> nn.ModuleList:
+        # transformers 4.x: model.layer / 5.x: model.model.layer (blocks moved into an encoder)
+        if hasattr(self.model, "layer"):
+            return self.model.layer
+        return self.model.model.layer
 
     def forward(self, pixel_values: torch.Tensor) -> Dict[str, torch.Tensor]:
         H, W = pixel_values.shape[-2:]
