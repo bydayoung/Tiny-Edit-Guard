@@ -18,6 +18,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import SegformerForSemanticSegmentation
 
+from .patch_head import masked_topk_mean
+
 DEFAULT_MODEL = "nvidia/mit-b0"
 
 
@@ -39,12 +41,15 @@ class SegFormerBaseline(nn.Module):
         )
         self.topk_ratio = topk_ratio
 
-    def forward(self, pixel_values: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, pixel_values: torch.Tensor,
+                pad_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """pad_mask: optional (B,1,H,W)/(B,H,W), 1 = real image; padded pixels never enter top-k."""
         H, W = pixel_values.shape[-2:]
         logits = self.model(pixel_values=pixel_values).logits  # (B, 1, H/4, W/4)
         mask_logits = F.interpolate(logits, size=(H, W), mode="bilinear", align_corners=False)
 
-        flat = mask_logits.flatten(1)
-        k = max(1, int(flat.shape[1] * self.topk_ratio))
-        cls_logits = flat.topk(k, dim=1).values.mean(dim=1)
+        valid = None
+        if pad_mask is not None:
+            valid = (pad_mask.unsqueeze(1) if pad_mask.dim() == 3 else pad_mask).flatten(1) > 0.5
+        cls_logits, _ = masked_topk_mean(mask_logits.flatten(1), valid, self.topk_ratio)
         return {"mask_logits": mask_logits, "cls_logits": cls_logits}

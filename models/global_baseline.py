@@ -5,12 +5,13 @@
 """
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
 
 from .backbone import DinoBackbone
+from .patchguard import patch_valid_from_pad
 
 
 class GlobalBaseline(nn.Module):
@@ -42,9 +43,20 @@ class GlobalBaseline(nn.Module):
         else:
             self.head = nn.Sequential(nn.LayerNorm(in_dim), nn.Linear(in_dim, 1))
 
-    def forward(self, pixel_values: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, pixel_values: torch.Tensor,
+                pad_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """pad_mask: optional (B,1,H,W)/(B,H,W), 1 = real image; mean-pool skips padding patches."""
         feats = self.backbone(pixel_values)
         x = feats["cls_token"]
         if self.use_mean_patch:
-            x = torch.cat([x, feats["patch_tokens"].mean(dim=1)], dim=-1)
+            valid = patch_valid_from_pad(pad_mask, self.backbone.patch_size)
+            x = torch.cat([x, masked_mean_tokens(feats["patch_tokens"], valid)], dim=-1)
         return {"cls_logits": self.head(x).squeeze(-1)}
+
+
+def masked_mean_tokens(tokens: torch.Tensor, valid: Optional[torch.Tensor]) -> torch.Tensor:
+    """(B, N, D) -> (B, D), averaging only valid patches."""
+    if valid is None:
+        return tokens.mean(dim=1)
+    w = valid.to(tokens.dtype).unsqueeze(-1)
+    return (tokens * w).sum(1) / w.sum(1).clamp(min=1.0)
