@@ -29,6 +29,7 @@ import torch
 
 import trainer as trainer_module
 from data.dataloader_hf import build_dataloaders
+from data.dataloader_local import build_local_dataloaders
 from losses import TinyEditLoss
 from models.backbone import DinoBackbone
 from models.global_baseline import GlobalBaseline
@@ -203,6 +204,17 @@ def parse_args():
             "pdyoung/TinyEdit-Guard-Dataset",
         ),
     )
+    p.add_argument(
+        "--data-root",
+        default=None,
+        help="Local data folder (e.g. data/v3_processed). If set, Hub is not used.",
+    )
+    p.add_argument(
+        "--metadata",
+        default=None,
+        help="Metadata CSV for --data-root (default: the only *.csv in it, "
+             "else data/final_split_metadata.csv).",
+    )
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--image-size", type=int, default=512)
     p.add_argument("--num-workers", type=int, default=0)
@@ -272,13 +284,23 @@ def main():
         )
 
     # 1) Load Hub dataset using normal load_dataset(), not streaming.
-    data = build_dataloaders(
-        dataset_id=args.dataset_id,
-        batch_size=args.batch_size,
-        image_size=args.image_size,
-        num_workers=args.num_workers,
-        token=args.hf_token,
-    )
+    #    --data-root switches to a local folder (e.g. data/v3_processed).
+    if args.data_root:
+        data = build_local_dataloaders(
+            data_root=args.data_root,
+            metadata=args.metadata,
+            batch_size=args.batch_size,
+            image_size=args.image_size,
+            num_workers=args.num_workers,
+        )
+    else:
+        data = build_dataloaders(
+            dataset_id=args.dataset_id,
+            batch_size=args.batch_size,
+            image_size=args.image_size,
+            num_workers=args.num_workers,
+            token=args.hf_token,
+        )
 
     # Pure SegFormer localization can use valid-mask-only splits.
     if args.model == "segformer":
@@ -332,7 +354,7 @@ def main():
 
     print("=" * 72)
     print("Tiny-Edit-Guard / Hugging Face Hub training")
-    print(f"dataset     : {args.dataset_id}")
+    print(f"dataset     : {args.data_root or args.dataset_id}")
     print(f"model       : {args.model}")
     print(f"train batch : {len(train_loader)}")
     print(f"val batch   : {len(val_loader)}")
