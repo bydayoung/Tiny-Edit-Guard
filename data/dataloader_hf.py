@@ -279,12 +279,15 @@ class TinyEditHFDataset(torch.utils.data.Dataset):
         return len(self.ds)
 
     def _image_tensor(self, image: Image.Image) -> torch.Tensor:
-        image = TF.resize(
-            image,
-            [self.image_size, self.image_size],
-            interpolation=InterpolationMode.BILINEAR,
-            antialias=True,
-        )
+        # image_size <= 0: keep the stored resolution (V3 data is already cropped / padded;
+        # resizing would wash out generation traces). train.py pads batches with PadCollate.
+        if self.image_size > 0:
+            image = TF.resize(
+                image,
+                [self.image_size, self.image_size],
+                interpolation=InterpolationMode.BILINEAR,
+                antialias=True,
+            )
         x = TF.to_tensor(image)
         x = TF.normalize(
             x,
@@ -298,6 +301,8 @@ class TinyEditHFDataset(torch.utils.data.Dataset):
         mask: Optional[Image.Image],
     ) -> torch.Tensor:
         if mask is None:
+            if self.image_size <= 0:
+                raise ValueError("mask is missing and image_size<=0: cannot infer mask size")
             return torch.zeros(
                 1,
                 self.image_size,
@@ -305,11 +310,12 @@ class TinyEditHFDataset(torch.utils.data.Dataset):
                 dtype=torch.float32,
             )
 
-        mask = TF.resize(
-            mask,
-            [self.image_size, self.image_size],
-            interpolation=InterpolationMode.NEAREST,
-        )
+        if self.image_size > 0:
+            mask = TF.resize(
+                mask,
+                [self.image_size, self.image_size],
+                interpolation=InterpolationMode.NEAREST,
+            )
 
         arr = np.asarray(mask, dtype=np.uint8)
         binary = (arr >= 128).astype(np.float32)
