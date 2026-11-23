@@ -215,6 +215,11 @@ def parse_args():
         help="Metadata CSV for --data-root (default: the only *.csv in it, "
              "else data/final_split_metadata.csv).",
     )
+    p.add_argument(
+        "--input-mode",
+        default=None,
+        help="Keep only rows with this input_mode value (v3 metadata).",
+    )
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--image-size", type=int, default=512)
     p.add_argument("--num-workers", type=int, default=0)
@@ -292,6 +297,7 @@ def main():
             batch_size=args.batch_size,
             image_size=args.image_size,
             num_workers=args.num_workers,
+            input_mode=args.input_mode,
         )
     else:
         data = build_dataloaders(
