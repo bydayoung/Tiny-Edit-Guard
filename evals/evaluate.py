@@ -89,6 +89,21 @@ def score_detection(test, threshold, split_name):
             sub = pd.concat([fakes[fakes.method == m], reals])
             add_detection_row(results, f"method:{m}", sub.label, sub.edit_probability, threshold,
                               note="method fake vs all real")
+    if "dataset" in test.columns:
+        # 출처별: 같은 출처의 real 과만 비교 (출처 간 난이도/편향이 섞이지 않게)
+        for d in sorted(test.dataset.dropna().unique()):
+            sub = test[test.dataset == d]
+            if sub.label.nunique() == 2:
+                add_detection_row(results, f"dataset:{d}", sub.label, sub.edit_probability, threshold,
+                                  note="dataset fake vs same-dataset real")
+    group_col = next((c for c in ("group_id", "final_group_id", "pair_id") if c in test.columns), None)
+    if group_col is not None:
+        acc, n_pairs = M.pair_accuracy(test[group_col], test.label, test.edit_probability)
+        results.append(dict(scope="pair_accuracy", n_fake=int(n_pairs), n_real=int(n_pairs),
+                            auroc=round(acc, 4) if not np.isnan(acc) else acc,
+                            auroc_ci_low=float("nan"), auroc_ci_high=float("nan"),
+                            auprc=float("nan"), f1=float("nan"),
+                            note=f"P(fake > its own real) over {n_pairs} pairs (auroc column)"))
     return results
 
 
@@ -104,8 +119,6 @@ def loc_row(scope, vals):
 
 def loc_from_csv(fakes):
     """trainer CSV 모드: sample_dice/sample_iou(이미 계산됨)를 bin별 평균. Pixel AUPRC는 없음."""
-    if "sample_dice" not in fakes.columns:
-        return []  # 분류 전용 모델(Global 등) — localization 출력 없음
     valid = fakes[to_bool(fakes.valid_mask)] if "valid_mask" in fakes.columns else fakes
     valid = valid.dropna(subset=["sample_dice"])
     if not len(valid):

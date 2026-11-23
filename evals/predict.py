@@ -1,6 +1,6 @@
 """학습된 체크포인트 → 샘플별 예측 내보내기 (평가 계약 포맷).
 
-팀 코드는 한 줄도 수정하지 않고 import만 한다. 레포 루트 기준 실행 예:
+모델은 models/factory.py (train.py 와 같은 함수)로 run_config.json 대로 구성한다. 실행 예:
 
   python3 evals/predict.py \
       --model patchguard_topk \
@@ -44,7 +44,11 @@ def make_safe_id(sample_id):
 
 
 class TestImages(Dataset):
-    """전처리 완료된 512×512 이미지 폴더를 읽는 추론 전용 경량 로더."""
+    """전처리 완료된 이미지 폴더를 읽는 추론 전용 경량 로더.
+
+    V3 데이터는 PNG·원본 해상도(크기 제각각)이므로 .png → .jpg 순으로 찾고,
+    배치는 data/collate.PadCollate 로 16 배수 패딩 + pad_mask 를 만든다.
+    """
 
     def __init__(self, meta: pd.DataFrame, processed_root):
         self.meta = meta.reset_index(drop=True)
@@ -59,45 +63,41 @@ class TestImages(Dataset):
 
     def __getitem__(self, i):
         row = self.meta.iloc[i]
-        path = self.root / row["split"] / "images" / f"{make_safe_id(row['id'])}.jpg"
+        base = self.root / row["split"] / "images" / make_safe_id(row["id"])
+        path = next((base.with_suffix(ext) for ext in (".png", ".jpg") if base.with_suffix(ext).exists()),
+                    base.with_suffix(".png"))
         img = Image.open(path).convert("RGB")
-        return self.tf(img), str(row["id"])
+        return {"image": self.tf(img), "id": str(row["id"])}
 
 
-def build_model(kind: str, repo_root: Path):
-    """팀 모델을 그대로 구성한다 (클래스 시그니처: 2026-10 doyeon/main 기준)."""
+def load_run_config(checkpoint: Path) -> dict:
+    cfg_path = Path(checkpoint).parent / "run_config.json"
+    return json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
+
+
+def build_model(kind: str, repo_root: Path, cfg: dict = None):
+    """train.py 와 같은 함수(models/factory.build_model)로, 체크포인트의 run_config 대로 구성한다."""
     sys.path.insert(0, str(repo_root))
-    from models.backbone import DinoBackbone
+    from models.factory import build_model as factory_build
 
-    if kind == "global":
-        from models.global_baseline import GlobalBaseline
-        return GlobalBaseline(DinoBackbone())
-    if kind == "global_mean":
-        from models.global_baseline import GlobalBaseline
-        return GlobalBaseline(DinoBackbone(), use_mean_patch=True)
-    if kind == "segformer":
-        from models.segformer_baseline import SegFormerBaseline
-        return SegFormerBaseline()
-    if kind in ("patchguard_avg", "patchguard_topk"):
-        from models.patchguard import PatchGuard
-        agg = "average" if kind.endswith("avg") else "topk"
-        return PatchGuard(DinoBackbone(), aggregation=agg)
-    raise ValueError(f"unknown model kind: {kind}")
+    return factory_build({**(cfg or {}), "model": kind})
 
 
 @torch.no_grad()
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True,
+    ap.add_argument("--model", default=None,
                     choices=["global", "global_mean", "segformer",
-                             "patchguard_avg", "patchguard_topk"])
+                             "patchguard_avg", "patchguard_topk", "patchguard_soft"],
+                    help="미지정 시 체크포인트 옆 run_config.json 의 model 사용")
     ap.add_argument("--checkpoint", required=True, help="trainer가 저장한 best.pt")
     ap.add_argument("--metadata", required=True)
     ap.add_argument("--processed-root", required=True)
     ap.add_argument("--split", default="val,test",
                     help="쉼표로 복수 지정 가능. threshold 선정에 val 예측이 필요하므로 기본은 val+test")
     ap.add_argument("--out", required=True, help="preds/<run_name>")
-    ap.add_argument("--batch-size", type=int, default=16)
+    ap.add_argument("--batch-size", type=int, default=1,
+                    help="1 = 이미지마다 원본 해상도 (크기가 다르면 큰 배치는 패딩이 늘어남)")
     ap.add_argument("--num-workers", type=int, default=2)
     ap.add_argument("--repo-root", default=str(Path(__file__).resolve().parents[1]))
     ap.add_argument("--limit", type=int, default=0, help="smoke 테스트용 샘플 제한 (0=전체)")
@@ -110,7 +110,11 @@ def main():
     else:
         device = "cpu"
 
-    model = build_model(args.model, Path(args.repo_root))
+    cfg = load_run_config(Path(args.checkpoint))
+    kind = args.model or cfg.get("model")
+    if not kind:
+        raise SystemExit("--model 을 지정하거나 체크포인트 옆에 run_config.json 을 두세요")
+    model = build_model(kind, Path(args.repo_root), cfg)
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     model.load_state_dict(state)
@@ -121,8 +125,11 @@ def main():
     meta = meta[meta.split.isin(splits)]
     if args.limit:
         meta = meta.head(args.limit)
-    dl = DataLoader(TestImages(meta, args.processed_root),
-                    batch_size=args.batch_size, num_workers=args.num_workers)
+    sys.path.insert(0, str(Path(args.repo_root)))
+    from data.collate import PadCollate
+
+    dl = DataLoader(TestImages(meta, args.processed_root), batch_size=args.batch_size,
+                    num_workers=args.num_workers, collate_fn=PadCollate())
 
     out = Path(args.out)
     mask_dir = out / "masks"
@@ -133,10 +140,11 @@ def main():
 
     rows, times, n_timed = [], [], 0
     wrote_mask = False
-    for bi, (images, ids) in enumerate(dl):
-        images = images.to(device)
+    for bi, batch in enumerate(dl):
+        images, ids = batch["pixel_values"].to(device), batch["id"]
+        pad_mask = batch["pad_mask"].to(device)
         t0 = time.perf_counter()
-        outputs = model(images)
+        outputs = model(images, pad_mask=pad_mask)
         if device == "cuda":
             torch.cuda.synchronize()
         dt = time.perf_counter() - t0
@@ -151,14 +159,16 @@ def main():
         for j, sid in enumerate(ids):
             rows.append({"id": sid, "edit_probability": float(probs[j])})
             if masks is not None:
-                arr = (np.clip(masks[j, 0], 0, 1) * 255).astype(np.uint8)
+                region = batch["pad_mask"][j, 0].numpy() > 0.5  # 패딩 제거 → 원본 크기로 저장
+                h, w = int(region.any(1).sum()), int(region.any(0).sum())
+                arr = (np.clip(masks[j, 0, :h, :w], 0, 1) * 255).astype(np.uint8)
                 Image.fromarray(arr).save(mask_dir / f"{make_safe_id(sid)}.png")
                 wrote_mask = True
 
     pd.DataFrame(rows).to_csv(out / "probs.csv", index=False)
 
     run_meta = {
-        "model": args.model,
+        "model": kind,
         "checkpoint": str(args.checkpoint),
         "split": args.split,
         "n_samples": len(rows),

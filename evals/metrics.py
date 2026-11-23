@@ -59,6 +59,26 @@ def bootstrap_auroc_ci(labels, probs, n_boot=1000, seed=0, alpha=0.05):
     return float(lo), float(hi)
 
 
+def pair_accuracy(group_ids, labels, probs):
+    """쌍(pair) 정확도: 같은 group 안에서 fake 점수 > real 점수인 (fake, real) 조합의 비율.
+
+    V3 처럼 real/fake 가 같은 원본에서 나온 exact pair 일 때, 내용·출처 차이 없이
+    '편집 흔적'만으로 구분하는지 보는 지표. 동점은 0.5. 쌍이 없으면 (nan, 0).
+    반환: (accuracy, 비교한 조합 수)
+    """
+    g = np.asarray(group_ids).astype(str)
+    labels, probs = np.asarray(labels), np.asarray(probs, dtype=float)
+    wins, n = 0.0, 0
+    for gid in np.unique(g):
+        idx = g == gid
+        f, r = probs[idx & (labels == 1)], probs[idx & (labels == 0)]
+        if len(f) and len(r):
+            diff = f[:, None] - r[None, :]
+            wins += (diff > 0).sum() + 0.5 * (diff == 0).sum()
+            n += diff.size
+    return (wins / n if n else float("nan")), n
+
+
 # ---------- Pixel-level (Localization) ----------
 # 규칙: 편집(Fake) 이미지 + valid_mask=True 에서만 계산. per-image 계산 후 평균.
 
