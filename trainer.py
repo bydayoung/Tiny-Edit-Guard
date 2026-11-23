@@ -82,6 +82,13 @@ def mask_valid(batch) -> torch.Tensor:
     return torch.ones_like(batch["label"], dtype=torch.bool)
 
 
+def pad_region(batch, like: torch.Tensor) -> torch.Tensor:
+    """(B, 1, H, W) float: 1 = real image pixel, 0 = padding (data/collate.py PadCollate)."""
+    if "pad_mask" not in batch:
+        return torch.ones_like(like[:, :1])
+    return _as_mask(batch["pad_mask"]).to(like.device)
+
+
 # ----------------------------------------------------------------------------- metrics
 
 def binary_auc(scores: torch.Tensor, labels: torch.Tensor) -> float:
@@ -154,7 +161,9 @@ class MetricTracker:
             self.has_mask = True
             prob = outputs["mask_logits"][valid].sigmoid()
             gt = _as_mask(batch["mask"])[valid]
-            pred = (prob > self.threshold).float()
+            region = pad_region(batch, gt)[valid]  # padding counts as neither TP/FP/FN
+            pred = (prob > self.threshold).float() * region
+            gt = gt * region
             tp = (pred * gt).flatten(1).sum(1)
             fp = (pred * (1 - gt)).flatten(1).sum(1)
             fn = ((1 - pred) * gt).flatten(1).sum(1)
@@ -166,10 +175,12 @@ class MetricTracker:
             dice = 2 * tp / (2 * tp + fp + fn).clamp(min=1e-8)
             self.per_image_dice.extend(dice[edited].cpu().tolist())
 
-            bins = (prob.flatten() * self.pixel_bins).long().clamp(max=self.pixel_bins - 1)
-            gt_flat = gt.flatten().bool()
-            self.pos_hist += torch.bincount(bins[gt_flat], minlength=self.pixel_bins).double().cpu()
-            self.neg_hist += torch.bincount(bins[~gt_flat], minlength=self.pixel_bins).double().cpu()
+            inside = region.flatten().bool()
+            bins = (prob.flatten()[inside] * self.pixel_bins).long().clamp(max=self.pixel_bins - 1)
+            gt_flat = gt.flatten()[inside].bool()
+            # .cpu() before .double(): MPS has no float64
+            self.pos_hist += torch.bincount(bins[gt_flat], minlength=self.pixel_bins).cpu().double()
+            self.neg_hist += torch.bincount(bins[~gt_flat], minlength=self.pixel_bins).cpu().double()
 
     def compute(self) -> Dict[str, float]:
         scores, labels = torch.cat(self.scores), torch.cat(self.labels)
@@ -213,6 +224,7 @@ class Trainer:
         epochs: int = 10,
         lr: float = 1e-3,
         backbone_lr: float = 1e-5,
+        lora_lr: Optional[float] = None,
         backbone_prefixes: Iterable[str] = ("backbone.", "model.segformer."),
         weight_decay: float = 0.05,
         warmup_ratio: float = 0.05,
@@ -229,6 +241,8 @@ class Trainer:
         Args:
             backbone_prefixes: parameter-name prefixes trained with `backbone_lr` (pretrained
                 encoders); everything else (heads/decoders) uses `lr`. Frozen params are skipped.
+            lora_lr: learning rate for LoRA adapters (names containing "lora_"); default = `lr`.
+                LoRA weights start at zero, so the tiny `backbone_lr` would barely move them.
             monitor: validation metric used to pick `best.pt` (e.g. "auroc" for V1, "pixel_dice" for V2).
             seed: re-seeds RNGs here (DataLoader shuffle, dropout). Also call `set_seed(seed)`
                 before building the model so head initialization is reproducible.
@@ -249,7 +263,8 @@ class Trainer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.optimizer = torch.optim.AdamW(
-            self._param_groups(lr, backbone_lr, tuple(backbone_prefixes), weight_decay)
+            self._param_groups(lr, backbone_lr, tuple(backbone_prefixes), weight_decay,
+                               lora_lr if lora_lr is not None else lr)
         )
         total_steps = epochs * len(train_loader)
         self.scheduler = get_cosine_schedule_with_warmup(
@@ -265,32 +280,48 @@ class Trainer:
         self.global_step = 0
         self.best = -math.inf if monitor_mode == "max" else math.inf
 
-    def _param_groups(self, lr, backbone_lr, prefixes, weight_decay):
-        groups = {(b, d): [] for b in (True, False) for d in (True, False)}
+    def _param_groups(self, lr, backbone_lr, prefixes, weight_decay, lora_lr=None):
+        lrs = {"backbone": backbone_lr, "lora": lora_lr if lora_lr is not None else lr, "head": lr}
+        groups = {(kind, d): [] for kind in lrs for d in (True, False)}
+        counts = {kind: 0 for kind in lrs}
         for name, p in self.model.named_parameters():
             if not p.requires_grad:
                 continue
-            is_backbone = name.startswith(prefixes)
+            if ".lora_A." in name or ".lora_B." in name:
+                kind = "lora"
+            elif name.startswith(prefixes):
+                kind = "backbone"
+            else:
+                kind = "head"
             decay = p.dim() > 1  # no decay for bias / norm
-            groups[(is_backbone, decay)].append(p)
+            groups[(kind, decay)].append(p)
+            counts[kind] += p.numel()
         out = []
-        for (is_backbone, decay), params in groups.items():
+        for (kind, decay), params in groups.items():
             if params:
                 out.append({
                     "params": params,
-                    "lr": backbone_lr if is_backbone else lr,
+                    "lr": lrs[kind],
                     "weight_decay": weight_decay if decay else 0.0,
                 })
-        n = sum(p.numel() for g in out for p in g["params"])
-        print(f"[trainer] trainable params: {n / 1e6:.2f}M")
+        n = sum(counts.values())
+        detail = ", ".join(f"{k} {v / 1e6:.2f}M" for k, v in counts.items() if v)
+        print(f"[trainer] trainable params: {n / 1e6:.2f}M ({detail})")
         return out
 
     def _to_device(self, batch):
-        return {k: v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v for k, v in batch.items()}
+        def move(v):
+            if not torch.is_tensor(v):
+                return v
+            if v.dtype == torch.float64:  # default_collate makes python floats float64; MPS has no float64
+                v = v.float()
+            return v.to(self.device, non_blocking=True)
+        return {k: move(v) for k, v in batch.items()}
 
     def _forward(self, batch):
+        kwargs = {"pad_mask": batch["pad_mask"]} if "pad_mask" in batch else {}
         with torch.autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-            outputs = self.model(pixel_values(batch))
+            outputs = self.model(pixel_values(batch), **kwargs)
         # losses / metrics in fp32
         return {k: v.float() if torch.is_tensor(v) else v for k, v in outputs.items()}
 
@@ -402,7 +433,7 @@ class Trainer:
         plus any per-sample batch fields (actual_mask_ratio, method, id, ...).
         """
         self.model.eval()
-        skip = {"pixel_values", "image", "mask"}
+        skip = {"pixel_values", "image", "mask", "pad_mask"}
         rows = []
         for batch in loader:
             batch = self._to_device(batch)
@@ -413,10 +444,13 @@ class Trainer:
                 "label": batch["label"].cpu().tolist(),
             }
             if "mask_logits" in outputs:
-                pred = (outputs["mask_logits"].sigmoid() > threshold).float()
-                cols["predicted_edit_ratio"] = pred.flatten(1).mean(1).cpu().tolist()
+                region = pad_region(batch, outputs["mask_logits"])  # ratios/Dice ignore padding
+                pred = (outputs["mask_logits"].sigmoid() > threshold).float() * region
+                cols["predicted_edit_ratio"] = (
+                    pred.flatten(1).sum(1) / region.flatten(1).sum(1).clamp(min=1)
+                ).cpu().tolist()
                 if "mask" in batch:
-                    gt = _as_mask(batch["mask"])
+                    gt = _as_mask(batch["mask"]) * region
                     tp = (pred * gt).flatten(1).sum(1)
                     fp = (pred * (1 - gt)).flatten(1).sum(1)
                     fn = ((1 - pred) * gt).flatten(1).sum(1)

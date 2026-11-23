@@ -1,26 +1,34 @@
 """Training entry point for Tiny-Edit-Guard.
 
-Works with the current repository layout without renaming
-`data/14_build_dataloader.py`.
+Data sources
+------------
+    --data-source local  (default) imports a loader module (default data/14_build_dataloader.py,
+                         override with --data-module path/to/v3_loader.py) and uses its
+                         train_dataset / val_dataset / test_dataset.
+    --data-source hf     data/dataloader_hf.py (Hugging Face Hub, --dataset-id).
+
+Loaders are rebuilt here so every model gets the same batching:
+    - PadCollate: variable-size images are padded to a multiple of 16, batch["pad_mask"] marks
+      real pixels (padding is excluded from top-k pooling, losses and metrics).
+    - PairBatchSampler (train): real/fake members of a group stay in the same batch.
+    - PairedAugment (train): flip / JPEG / blur with identical parameters within a pair.
+    - val/test default to batch size 1 so images are scored at their own resolution.
 
 Examples
 --------
 Smoke test:
     python train.py --model patch_topk --epochs 1 --max-train-batches 5 --max-val-batches 2
 
-Patch Average:
-    python train.py --model patch_avg --epochs 10 --output-dir runs/patch_avg_s0
+Recommended V3 runs (same settings for every model -> fair comparison):
+    python train.py --model global_cls --output-dir runs/global_cls_s0
+    python train.py --model patch_avg  --output-dir runs/patch_avg_s0
+    python train.py --model patch_topk --output-dir runs/patch_topk_s0
+    python train.py --model patch_soft --output-dir runs/patch_soft_s0
+    python train.py --model segformer  --output-dir runs/segformer_s0
 
-Patch Top-k + patch supervision:
-    python train.py --model patch_topk --epochs 10 --patch-weight 0.1 \
-        --output-dir runs/patch_topk_patchsup_s0
-
-Global baseline:
-    python train.py --model global_cls --epochs 10 --output-dir runs/global_cls_s0
-
-SegFormer localization baseline:
-    python train.py --model segformer --epochs 10 --monitor pixel_f1 \
-        --output-dir runs/segformer_s0
+Old (pre-V3) behaviour:
+    python train.py --model patch_topk --topk-ratio 0.10 --patch-weight 0 --lora-rank 0 \
+        --feature-layers "" --no-augment --no-pair-batches
 """
 from __future__ import annotations
 
@@ -34,19 +42,16 @@ from typing import Iterator, Optional
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 
 import trainer as trainer_module
-from losses import TinyEditLoss
-from models import (
-    DinoBackbone,
-    GlobalBaseline,
-    SegFormerBaseline,
-)
-from models.patchguard import PatchGuard
-
+from data.collate import GroupIdDataset, PadCollate, PairBatchSampler, PairedAugment, find_group_ids
+from losses import PATCH_TARGETS, TinyEditLoss
+from models.factory import AGGREGATION, MODEL_ALIASES, build_model
 
 ROOT = Path(__file__).resolve().parent
-DATA_LOADER_FILE = ROOT / "data" / "14_build_dataloader.py"
+DEFAULT_DATA_MODULE = ROOT / "data" / "14_build_dataloader.py"
+Trainer = trainer_module.Trainer
 
 
 # -----------------------------------------------------------------------------
@@ -68,35 +73,75 @@ def set_seed(seed: int) -> None:
 
 
 # -----------------------------------------------------------------------------
-# Current data-loader compatibility
+# Data
 # -----------------------------------------------------------------------------
 
-def load_current_data_module():
-    """Import data/14_build_dataloader.py although the filename starts with a digit."""
-    if not DATA_LOADER_FILE.exists():
-        raise FileNotFoundError(
-            f"Could not find {DATA_LOADER_FILE}. "
-            "Run train.py from the Tiny-Edit-Guard repository root."
-        )
-
-    spec = importlib.util.spec_from_file_location(
-        "tinyedit_current_dataloader",
-        DATA_LOADER_FILE,
-    )
+def load_module(path: Path):
+    """Import a loader module from a file path (works although the filename starts with a digit)."""
+    if not path.exists():
+        raise FileNotFoundError(f"Could not find {path}. Run train.py from the repository root.")
+    spec = importlib.util.spec_from_file_location("tinyedit_data_module", path)
     if spec is None or spec.loader is None:
-        raise ImportError(f"Could not import {DATA_LOADER_FILE}")
-
+        raise ImportError(f"Could not import {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-class LoaderAdapter:
-    """Wrap the existing DataLoader.
+def get_datasets(args):
+    """-> (train_dataset, val_dataset, test_dataset)"""
+    if args.data_source == "hf":
+        from data.dataloader_hf import build_dataloaders
 
-    - Renames batch["image"] -> batch["pixel_values"] for trainer.py.
-    - Optionally limits the number of batches for smoke tests.
-    """
+        d = build_dataloaders(dataset_id=args.dataset_id, batch_size=args.batch_size,
+                              image_size=args.image_size, num_workers=args.num_workers,
+                              token=args.hf_token)
+        return d["train_dataset"], d["val_dataset"], d["test_dataset"]
+
+    module = load_module(Path(args.data_module))
+    names = ("train_dataset", "val_dataset", "test_dataset")
+    missing = [n for n in names if not hasattr(module, n)]
+    if missing:
+        raise AttributeError(f"{args.data_module} must define {names}; missing {missing}")
+    return tuple(getattr(module, n) for n in names)
+
+
+def with_group_ids(dataset, name: str):
+    groups = find_group_ids(dataset)
+    if groups is None:
+        print(f"[data] {name}: no group id column ({'/'.join(('final_group_id', 'group_id', 'pair_id'))}) "
+              "-> pair batching / paired augmentation fall back to per-sample")
+        return dataset, None
+    return GroupIdDataset(dataset, groups), groups
+
+
+def build_loaders(args):
+    train_ds, val_ds, test_ds = get_datasets(args)
+    train_ds, train_groups = with_group_ids(train_ds, "train")
+    val_ds, _ = with_group_ids(val_ds, "val")
+    test_ds, _ = with_group_ids(test_ds, "test")
+
+    augment = PairedAugment(seed=args.seed) if args.augment else None
+    train_collate = PadCollate(augment=augment)
+    eval_collate = PadCollate()
+    common = dict(num_workers=args.num_workers, pin_memory=torch.cuda.is_available())
+
+    if args.pair_batches and train_groups is not None:
+        sampler = PairBatchSampler(train_groups, args.batch_size, shuffle=True, seed=args.seed)
+        train_loader = DataLoader(train_ds, batch_sampler=sampler, collate_fn=train_collate, **common)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                                  collate_fn=train_collate, **common)
+
+    def eval_loader(ds):
+        return DataLoader(ds, batch_size=args.eval_batch_size, shuffle=False,
+                          collate_fn=eval_collate, **common)
+
+    return train_loader, eval_loader(val_ds), eval_loader(test_ds)
+
+
+class LoaderAdapter:
+    """Optionally limits the number of batches (smoke tests); renames image -> pixel_values."""
 
     def __init__(self, loader, max_batches: Optional[int] = None):
         self.loader = loader
@@ -105,158 +150,49 @@ class LoaderAdapter:
 
     def __len__(self):
         n = len(self.loader)
-        if self.max_batches is None:
-            return n
-        return min(n, self.max_batches)
+        return n if self.max_batches is None else min(n, self.max_batches)
 
     def __iter__(self) -> Iterator[dict]:
         for i, batch in enumerate(self.loader):
             if self.max_batches is not None and i >= self.max_batches:
                 break
-
-            if "pixel_values" not in batch:
-                if "image" not in batch:
-                    raise KeyError(
-                        "DataLoader batch must contain 'image' or 'pixel_values'."
-                    )
+            if "pixel_values" not in batch and "image" in batch:
                 batch = dict(batch)
                 batch["pixel_values"] = batch.pop("image")
-
             yield batch
 
 
 # -----------------------------------------------------------------------------
-# Validation metric patch:
-# current trainer.MetricTracker does not filter invalid localization masks.
+# Args
 # -----------------------------------------------------------------------------
 
-class ValidMaskMetricTracker(trainer_module.MetricTracker):
-    @torch.no_grad()
-    def update(self, outputs, batch):
-        # Image-level metrics: every sample.
-        self.scores.append(outputs["cls_logits"].sigmoid().float().cpu())
-        self.labels.append(batch["label"].float().cpu())
-
-        if "mask_logits" not in outputs or "mask" not in batch:
-            return
-
-        valid = batch.get("valid_mask")
-        if valid is None:
-            valid = torch.ones(
-                batch["label"].shape[0],
-                dtype=torch.bool,
-                device=batch["label"].device,
-            )
-        else:
-            valid = valid.bool()
-
-        if not valid.any():
-            return
-
-        self.has_mask = True
-
-        pred = (
-            outputs["mask_logits"][valid].sigmoid() > self.threshold
-        ).float()
-
-        gt = trainer_module._as_mask(batch["mask"][valid])
-
-        tp = (pred * gt).flatten(1).sum(1)
-        fp = (pred * (1 - gt)).flatten(1).sum(1)
-        fn = ((1 - pred) * gt).flatten(1).sum(1)
-
-        self.tp += tp.sum().item()
-        self.fp += fp.sum().item()
-        self.fn += fn.sum().item()
-
-        # Per-image F1 only for edited + valid-mask samples.
-        edited = batch["label"][valid].bool()
-        f1 = 2 * tp / (2 * tp + fp + fn).clamp(min=1e-8)
-        self.per_image_f1.extend(f1[edited].cpu().tolist())
-
-
-# Trainer.validate() looks up MetricTracker from its module globals.
-trainer_module.MetricTracker = ValidMaskMetricTracker
-Trainer = trainer_module.Trainer
-
-
-# -----------------------------------------------------------------------------
-# Model construction
-# -----------------------------------------------------------------------------
-
-def build_model(args):
-    if args.model in {"global", "global_cls"}:
-        backbone = DinoBackbone(
-            freeze=args.freeze_backbone,
-            unfreeze_last_n=args.unfreeze_last_n,
-        )
-        return GlobalBaseline(
-            backbone=backbone,
-            use_mean_patch=False,
-            hidden_dim=args.head_hidden_dim,
-            dropout=args.dropout,
-        )
-
-    if args.model == "global_cls_mean":
-        backbone = DinoBackbone(
-            freeze=args.freeze_backbone,
-            unfreeze_last_n=args.unfreeze_last_n,
-        )
-        return GlobalBaseline(
-            backbone=backbone,
-            use_mean_patch=True,
-            hidden_dim=args.head_hidden_dim,
-            dropout=args.dropout,
-        )
-
-    if args.model in {"patch_avg", "patch_topk"}:
-        backbone = DinoBackbone(
-            freeze=args.freeze_backbone,
-            unfreeze_last_n=args.unfreeze_last_n,
-        )
-
-        aggregation = (
-            "average"
-            if args.model == "patch_avg"
-            else "topk"
-        )
-
-        return PatchGuard(
-            backbone=backbone,
-            aggregation=aggregation,
-            patch_hidden_dim=args.patch_hidden_dim,
-            topk_ratio=args.topk_ratio,
-            dropout=args.dropout,
-        )
-
-    if args.model == "segformer":
-        return SegFormerBaseline(
-            topk_ratio=args.segformer_topk_ratio,
-        )
-
-    raise ValueError(f"Unknown model: {args.model}")
-
-
-def parse_args():
+def parse_args(argv=None, data_source_default: str = "local"):
     p = argparse.ArgumentParser()
 
-    p.add_argument(
-        "--model",
-        default="patch_topk",
-        choices=[
-            "global",
-            "global_cls",
-            "global_cls_mean",
-            "patch_avg",
-            "patch_topk",
-            "segformer",
-        ],
-    )
+    p.add_argument("--model", default="patch_topk", choices=sorted(MODEL_ALIASES))
+
+    # Data
+    p.add_argument("--data-source", choices=["local", "hf"], default=data_source_default)
+    p.add_argument("--data-module", default=str(DEFAULT_DATA_MODULE),
+                   help="[local] loader module defining train_dataset / val_dataset / test_dataset")
+    p.add_argument("--dataset-id", default=os.environ.get("TINYEDIT_HF_DATASET", "pdyoung/TinyEdit-Guard-Dataset"))
+    p.add_argument("--hf-token", default=None)
+    p.add_argument("--image-size", type=int, default=0,
+                   help="[hf] resize size in dataloader_hf.py; 0 = keep stored resolution (V3)")
+    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--eval-batch-size", type=int, default=1,
+                   help="1 = every val/test image at its own resolution (no shared padding)")
+    p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--pair-batches", action=argparse.BooleanOptionalAction, default=True,
+                   help="keep real/fake pairs (same group id) in the same training batch")
+    p.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True,
+                   help="paired flip / JPEG(65-100) / blur augmentation on the training set")
 
     # Training
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--backbone-lr", type=float, default=1e-5)
+    p.add_argument("--lora-lr", type=float, default=2e-4)
     p.add_argument("--weight-decay", type=float, default=0.05)
     p.add_argument("--warmup-ratio", type=float, default=0.05)
     p.add_argument("--grad-clip", type=float, default=1.0)
@@ -268,25 +204,32 @@ def parse_args():
     # Backbone / heads
     p.add_argument("--freeze-backbone", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--unfreeze-last-n", type=int, default=0)
+    p.add_argument("--lora-rank", type=int, default=8,
+                   help="LoRA on DINOv3 attention q/v (0 = off). Applies to every DINOv3 model "
+                        "(global / patch) so they are compared under the same backbone policy")
+    p.add_argument("--lora-alpha", type=float, default=16.0)
+    p.add_argument("--lora-last-n", type=int, default=0, help="LoRA only in the last n blocks (0 = all)")
+    p.add_argument("--lora-dropout", type=float, default=0.0)
+    p.add_argument("--feature-layers", type=str, default="3,6,9,12",
+                   help="1-based DINOv3 blocks fused for the PatchGuard mask decoder ('' = last layer only)")
     p.add_argument("--head-hidden-dim", type=int, default=256)
     p.add_argument("--patch-hidden-dim", type=int, default=256)
     p.add_argument("--dropout", type=float, default=0.1)
-    p.add_argument("--topk-ratio", type=float, default=0.10)
+    p.add_argument("--topk-ratio", type=float, default=0.02,
+                   help="tiny edits cover ~1-3%% of patches; 0.10 dilutes them")
     p.add_argument("--segformer-topk-ratio", type=float, default=0.01)
 
     # Loss
     p.add_argument("--mask-weight", type=float, default=1.0)
-    p.add_argument("--patch-weight", type=float, default=0.0)
+    p.add_argument("--patch-weight", type=float, default=0.2,
+                   help="patch-level supervision for PatchGuard (ignored for global / segformer)")
+    p.add_argument("--patch-target", choices=PATCH_TARGETS, default="soft")
     p.add_argument("--mask-bce-weight", type=float, default=1.0)
     p.add_argument("--mask-dice-weight", type=float, default=1.0)
 
-    # Checkpoint selection
-    p.add_argument("--monitor", type=str, default=None)
-    p.add_argument(
-        "--monitor-mode",
-        choices=["max", "min"],
-        default="max",
-    )
+    # Checkpoint selection (same metric for every model unless overridden)
+    p.add_argument("--monitor", type=str, default="auroc")
+    p.add_argument("--monitor-mode", choices=["max", "min"], default="max")
 
     # Smoke-test / debugging
     p.add_argument("--max-train-batches", type=int, default=None)
@@ -295,35 +238,32 @@ def parse_args():
                    help="skip writing preds_val.csv / preds_test.csv after training")
     p.add_argument("--log-every", type=int, default=50)
 
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
-def main():
-    args = parse_args()
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+def main(argv=None, data_source_default: str = "local"):
+    args = parse_args(argv, data_source_default)
 
     # The existing data code uses relative paths such as ./data/...
     os.chdir(ROOT)
     set_seed(args.seed)
 
-    if args.patch_weight > 0.0 and args.model not in {"patch_avg", "patch_topk"}:
-        raise ValueError(
-            "--patch-weight > 0 is only valid for patch_avg / patch_topk."
-        )
+    kind = MODEL_ALIASES[args.model]
+    if kind not in AGGREGATION and args.patch_weight > 0.0:
+        print(f"[train] --patch-weight ignored for {kind} (PatchGuard only)")
+        args.patch_weight = 0.0
 
-    # 1) Existing data loaders.
-    data_module = load_current_data_module()
+    # 1) Data.
+    train_loader, val_loader, test_loader = build_loaders(args)
+    train_loader = LoaderAdapter(train_loader, max_batches=args.max_train_batches)
+    val_loader_lim = LoaderAdapter(val_loader, max_batches=args.max_val_batches)
 
-    train_loader = LoaderAdapter(
-        data_module.train_loader,
-        max_batches=args.max_train_batches,
-    )
-    val_loader = LoaderAdapter(
-        data_module.val_loader,
-        max_batches=args.max_val_batches,
-    )
-
-    # 2) Model.
-    model = build_model(args)
+    # 2) Model (models/factory.py: the same function rebuilds it in app.py / evals/predict.py).
+    model = build_model(vars(args))
 
     # 3) Loss.
     loss_fn = TinyEditLoss(
@@ -331,30 +271,24 @@ def main():
         patch_weight=args.patch_weight,
         mask_bce_weight=args.mask_bce_weight,
         mask_dice_weight=args.mask_dice_weight,
+        patch_target=args.patch_target,
     )
 
-    # GlobalBaseline has no mask output, so mask loss is simply ignored.
-    # PatchGuard / SegFormer use valid_mask=True samples only.
-
-    monitor = args.monitor
-    if monitor is None:
-        monitor = "pixel_f1" if args.model == "segformer" else "auc"
-
-    output_dir = args.output_dir or f"runs/{args.model}_seed{args.seed}"
-    output_path = ROOT / output_dir
+    output_path = ROOT / (args.output_dir or f"runs/{args.model}_seed{args.seed}")
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Save the run arguments for reproducibility.
+    # Save the run arguments: models/factory.py rebuilds the model from this file.
     with open(output_path / "run_config.json", "w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2, ensure_ascii=False)
 
     print("=" * 72)
     print("Tiny-Edit-Guard training")
     print(f"model       : {args.model}")
+    print(f"data        : {args.data_source} ({args.data_module if args.data_source == 'local' else args.dataset_id})")
     print(f"seed        : {args.seed}")
-    print(f"train batch : {len(train_loader)}")
-    print(f"val batch   : {len(val_loader)}")
-    print(f"monitor     : val_{monitor}")
+    print(f"train batch : {len(train_loader)}  (pair batches={args.pair_batches}, augment={args.augment})")
+    print(f"val batch   : {len(val_loader_lim)}")
+    print(f"monitor     : val_{args.monitor}")
     print(f"output      : {output_path}")
     print("=" * 72)
 
@@ -362,16 +296,17 @@ def main():
     trainer = Trainer(
         model=model,
         train_loader=train_loader,
-        val_loader=val_loader,
+        val_loader=val_loader_lim,
         loss_fn=loss_fn,
         epochs=args.epochs,
         lr=args.lr,
         backbone_lr=args.backbone_lr,
+        lora_lr=args.lora_lr,
         weight_decay=args.weight_decay,
         warmup_ratio=args.warmup_ratio,
         grad_clip=args.grad_clip,
         amp=not args.no_amp,
-        monitor=monitor,
+        monitor=args.monitor,
         monitor_mode=args.monitor_mode,
         output_dir=str(output_path),
         log_every=args.log_every,
@@ -384,11 +319,10 @@ def main():
     final_metrics = trainer.fit()
 
     # 6) Per-sample predictions from best.pt -> evals/evaluate.py --trainer-csv.
-    #    Full val/test loaders (real + edited), so classification metrics are complete.
     if not args.skip_predict:
         trainer.export_predictions({
-            "val": LoaderAdapter(data_module.val_loader, max_batches=args.max_val_batches),
-            "test": LoaderAdapter(data_module.test_loader, max_batches=args.max_val_batches),
+            "val": LoaderAdapter(val_loader, max_batches=args.max_val_batches),
+            "test": LoaderAdapter(test_loader, max_batches=args.max_val_batches),
         })
 
     print("=" * 72)

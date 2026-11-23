@@ -18,9 +18,23 @@
 
 브라우저: http://127.0.0.1:7860
 
-전처리는 학습과 동일하게 맞춘다:
-  RGB → 512×512 BILINEAR resize → ToTensor → ImageNet mean/std 정규화
-(data/13_preprocess_images.py, evals/predict.py 와 같은 규칙)
+Vercel 등 서버리스 배포 (python app.py 를 실행하지 않고 모듈을 import 하는 경우):
+  모듈 맨 아래의 전역 `app` 을 쓰며, 설정은 환경변수로 받는다.
+    TEG_CHECKPOINT       로컬 체크포인트 경로 (예: weights/deploy.pt)
+    TEG_CHECKPOINT_URL   또는 다운로드할 체크포인트 URL
+    TEG_HF_REPO          또는 Hugging Face Hub 레포 id (TEG_HF_FILE 기본 deploy.pt, HF_TOKEN 사용)
+    TEG_MODEL            run_config 가 없을 때 모델 종류
+    TEG_CLS_THRESHOLD / TEG_MASK_THRESHOLD   임계값 (기본 0.5)
+    TEG_DEMO=1           체크포인트 없이 데모 모드
+  체크포인트는 export_for_deploy.py 로 만든 deploy.pt 를 권장한다
+  (백본 config 가 들어 있어 실행 시 gated DINOv3 가중치를 내려받지 않는다).
+
+전처리는 체크포인트가 학습된 방식에 맞춘다 (run_config.json 으로 판별):
+  - V3 이후 train.py 로 학습한 체크포인트: 원본 해상도 유지 → 16 배수로 패딩(pad_mask 전달).
+    긴 변이 MAX_INFER_SIDE 보다 크면 속도를 위해 그 크기로만 축소한다.
+  - 이전 체크포인트: RGB → 512×512 BILINEAR resize (예전 학습 규칙)
+  공통: ToTensor → ImageNet mean/std 정규화
+모델 구성은 models/factory.py 의 build_model 로 train.py 와 동일하게 만든다.
 """
 from __future__ import annotations
 
@@ -29,18 +43,21 @@ import base64
 import io
 import json
 import os
+import threading
 import time
-from argparse import Namespace
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from flask import Flask, jsonify, render_template, request, send_from_directory
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
+from werkzeug.exceptions import RequestEntityTooLarge
 
 ROOT = Path(__file__).resolve().parent
 
-INPUT_SIZE = 512
+INPUT_SIZE = 512                 # 이전(512 resize) 체크포인트용 입력 크기
+MAX_INFER_SIDE = 1024            # 원본 해상도 추론 시 긴 변 상한 (CPU 속도)
+PATCH_MULTIPLE = 16
 IMAGE_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGE_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
@@ -49,28 +66,13 @@ MIN_REGION_RATIO = 0.0005        # 이보다 작은 연결 영역(전체 대비)
 MAX_REGIONS = 5                  # 박스로 표시할 최대 영역 수
 ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
-# train.py 의 --model 이름과 evals/predict.py 의 이름을 모두 받아준다.
-MODEL_ALIASES = {
-    "global": "global_cls",
-    "global_cls": "global_cls",
-    "global_mean": "global_cls_mean",
-    "global_cls_mean": "global_cls_mean",
-    "patch_avg": "patch_avg",
-    "patchguard_avg": "patch_avg",
-    "patch_topk": "patch_topk",
-    "patchguard_topk": "patch_topk",
-    "segformer": "segformer",
-}
+# train.py 의 --model 이름과 evals/predict.py 의 이름을 모두 받아준다 (models/factory.py 와 공유).
+from models.factory import MODEL_ALIASES  # noqa: E402
 
-# train.py parse_args() 의 기본값과 동일
-TRAIN_DEFAULTS = dict(
-    unfreeze_last_n=0,
-    head_hidden_dim=256,
-    patch_hidden_dim=256,
-    dropout=0.1,
-    topk_ratio=0.10,
-    segformer_topk_ratio=0.01,
-)
+
+def is_native_resolution(cfg: Dict) -> bool:
+    """V3 이후 train.py 는 run_config 에 eval_batch_size 를 남긴다 = 원본 해상도로 학습/평가."""
+    return "eval_batch_size" in cfg
 
 
 # =============================================================================
@@ -98,31 +100,31 @@ def load_run_config(checkpoint: Path) -> Dict:
     return {}
 
 
-def build_model(kind: str, cfg: Dict):
-    """train.py 의 build_model() 과 같은 구성으로 모델을 만든다."""
-    from models import DinoBackbone, GlobalBaseline, SegFormerBaseline
-    from models.patchguard import PatchGuard
+def hf_model_from_config(hf_config: Dict, segformer: bool = False):
+    """저장해 둔 HF config(dict)로 가중치 다운로드 없이 빈 모델을 만든다."""
+    from transformers import AutoConfig, AutoModel
 
-    a = Namespace(**{**TRAIN_DEFAULTS, **cfg})
+    d = dict(hf_config)
+    config = AutoConfig.for_model(d.pop("model_type"), **d)
+    if segformer:
+        from transformers import SegformerForSemanticSegmentation
+        return SegformerForSemanticSegmentation(config)
+    return AutoModel.from_config(config)
 
-    if kind in ("global_cls", "global_cls_mean"):
-        return GlobalBaseline(
-            backbone=DinoBackbone(freeze=True),
-            use_mean_patch=(kind == "global_cls_mean"),
-            hidden_dim=a.head_hidden_dim,
-            dropout=a.dropout,
-        )
-    if kind in ("patch_avg", "patch_topk"):
-        return PatchGuard(
-            backbone=DinoBackbone(freeze=True),
-            aggregation="average" if kind == "patch_avg" else "topk",
-            patch_hidden_dim=a.patch_hidden_dim,
-            topk_ratio=a.topk_ratio,
-            dropout=a.dropout,
-        )
-    if kind == "segformer":
-        return SegFormerBaseline(topk_ratio=a.segformer_topk_ratio)
-    raise ValueError(f"알 수 없는 모델 종류: {kind}")
+
+def build_model(kind: str, cfg: Dict, hf_config: Optional[Dict] = None):
+    """train.py 와 같은 함수(models/factory.build_model)로 모델을 만든다.
+
+    hf_config 가 있으면 (export_for_deploy.py 로 만든 체크포인트) 백본을 config 로만 만들고,
+    가중치는 이후 load_state_dict 로 채운다. 없으면 기존처럼 from_pretrained 를 쓴다.
+    LoRA / 레이어 융합 / top-k 비율 등은 run_config 값 그대로 재현된다.
+    """
+    from models.factory import build_model as factory_build
+
+    hf_model = None
+    if hf_config is not None:
+        hf_model = hf_model_from_config(hf_config, segformer=(kind == "segformer"))
+    return factory_build({**cfg, "model": kind}, hf_model=hf_model)
 
 
 class Detector:
@@ -135,7 +137,11 @@ class Detector:
         if not ckpt_path.exists():
             raise FileNotFoundError(f"체크포인트가 없습니다: {ckpt_path}")
 
-        cfg = load_run_config(ckpt_path)
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        # export_for_deploy.py 로 만든 체크포인트는 run_config / hf_config 를 안에 들고 있다.
+        embedded = isinstance(ckpt, dict) and "hf_config" in ckpt
+        cfg = (ckpt.get("run_config") or {}) if embedded else load_run_config(ckpt_path)
+        hf_config = ckpt["hf_config"] if embedded else None
         kind = model_kind or cfg.get("model")
         if not kind:
             raise ValueError(
@@ -147,9 +153,9 @@ class Detector:
         self.kind = MODEL_ALIASES[kind]
 
         self.device = pick_device(device)
-        self.model = build_model(self.kind, cfg)
+        self.native = is_native_resolution(cfg)
+        self.model = build_model(self.kind, cfg, hf_config)
 
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
         self.model.load_state_dict(state)
         self.model.to(self.device).eval()
@@ -158,26 +164,44 @@ class Detector:
         self.epoch = ckpt.get("epoch") if isinstance(ckpt, dict) else None
         print(f"[app] loaded {ckpt_path} | model={self.kind} | device={self.device}")
 
-    @staticmethod
-    def preprocess(img: Image.Image):
+    def preprocess(self, img: Image.Image):
+        """-> (x (1,3,H,W), pad_mask (1,1,H,W) or None, (h, w) of the real image inside x)."""
         import torch
 
-        x = img.convert("RGB").resize((INPUT_SIZE, INPUT_SIZE), Image.Resampling.BILINEAR)
+        x = img.convert("RGB")
+        if not self.native:  # 이전 체크포인트: 학습 때처럼 512×512 로 늘림
+            x = x.resize((INPUT_SIZE, INPUT_SIZE), Image.Resampling.BILINEAR)
+            arr = (np.asarray(x, dtype=np.float32) / 255.0 - IMAGE_MEAN) / IMAGE_STD
+            return torch.from_numpy(arr.transpose(2, 0, 1)).unsqueeze(0), None, (INPUT_SIZE, INPUT_SIZE)
+
+        w, h = x.size
+        s = min(1.0, MAX_INFER_SIDE / max(w, h))
+        if s < 1.0:
+            x = x.resize((max(1, round(w * s)), max(1, round(h * s))), Image.Resampling.BILINEAR)
+            w, h = x.size
         arr = (np.asarray(x, dtype=np.float32) / 255.0 - IMAGE_MEAN) / IMAGE_STD
-        return torch.from_numpy(arr.transpose(2, 0, 1)).unsqueeze(0)
+        H = -(-h // PATCH_MULTIPLE) * PATCH_MULTIPLE
+        W = -(-w // PATCH_MULTIPLE) * PATCH_MULTIPLE
+        canvas = np.zeros((H, W, 3), dtype=np.float32)  # 0 = ImageNet 평균색 (학습 패딩과 동일)
+        canvas[:h, :w] = arr
+        pad = np.zeros((1, 1, H, W), dtype=np.float32)
+        pad[..., :h, :w] = 1.0
+        return (torch.from_numpy(canvas.transpose(2, 0, 1)).unsqueeze(0),
+                torch.from_numpy(pad), (h, w))
 
     def predict(self, img: Image.Image) -> Tuple[float, Optional[np.ndarray]]:
-        """Returns (edit_probability, prob_map[512,512] or None)."""
+        """Returns (edit_probability, prob_map[h, w] or None)."""
         import torch
 
-        x = self.preprocess(img).to(self.device)
+        x, pad_mask, (h, w) = self.preprocess(img)
+        kwargs = {"pad_mask": pad_mask.to(self.device)} if pad_mask is not None else {}
         with torch.no_grad():
-            out = self.model(x)
+            out = self.model(x.to(self.device), **kwargs)
         prob = float(torch.sigmoid(out["cls_logits"]).float().cpu()[0])
         mask = out.get("mask_logits")
         if mask is None:
             return prob, None
-        prob_map = torch.sigmoid(mask).float().cpu().numpy()[0, 0]
+        prob_map = torch.sigmoid(mask).float().cpu().numpy()[0, 0, :h, :w]  # 패딩 제거
         return prob, prob_map
 
     def info(self) -> Dict:
@@ -292,7 +316,7 @@ def build_result(img: Image.Image, prob: float, prob_map: Optional[np.ndarray],
     if prob_map is None:
         return result
 
-    # 512×512 확률맵 → 원본 비율로 되돌림 (학습 때 stretch-resize 했으므로 그대로 역변환)
+    # 확률맵 → 표시 크기로 맞춤 (512 stretch 체크포인트는 역변환, 원본 해상도 체크포인트는 단순 축척)
     pm = Image.fromarray((np.clip(prob_map, 0, 1) * 255).astype(np.uint8))
     pm = pm.resize((W, H), Image.Resampling.BILINEAR)
     pm_arr = np.asarray(pm, dtype=np.float32) / 255.0
@@ -360,8 +384,12 @@ def create_app(detector, cls_threshold: float, mask_threshold: float,
 
     @app.get("/api/info")
     def info():
-        return jsonify({**detector.info(), "cls_threshold": cls_threshold,
-                        "mask_threshold": mask_threshold})
+        try:
+            d = detector.info()
+        except Exception as e:  # noqa: BLE001  (서버리스에서 모델 로드 실패를 화면에 보여주기 위함)
+            app.logger.exception("model load failed")
+            return jsonify({"mode": "error", "error": f"모델을 불러오지 못했습니다: {e}"}), 500
+        return jsonify({**d, "cls_threshold": cls_threshold, "mask_threshold": mask_threshold})
 
     @app.get("/api/examples")
     def examples():
@@ -391,6 +419,8 @@ def create_app(detector, cls_threshold: float, mask_threshold: float,
                     return jsonify({"error": "예시 이미지를 찾을 수 없습니다."}), 404
                 return run(Image.open(path), name)
             return jsonify({"error": "이미지가 전송되지 않았습니다."}), 400
+        except RequestEntityTooLarge:
+            raise  # 아래 413 핸들러로 보낸다
         except Image.UnidentifiedImageError:
             return jsonify({"error": "이미지 파일을 읽을 수 없습니다. JPG/PNG 파일을 올려주세요."}), 400
         except Exception as e:  # noqa: BLE001
@@ -399,9 +429,97 @@ def create_app(detector, cls_threshold: float, mask_threshold: float,
 
     @app.errorhandler(413)
     def too_large(_):
-        return jsonify({"error": "파일이 너무 큽니다 (최대 25MB)."}), 413
+        mb = app.config["MAX_CONTENT_LENGTH"] / (1024 * 1024)
+        return jsonify({"error": f"파일이 너무 큽니다 (최대 {mb:g}MB)."}), 413
 
     return app
+
+
+# =============================================================================
+# 서버리스(Vercel) 진입점: 환경변수로 설정, 모델은 첫 요청 때 로드
+# =============================================================================
+
+class LazyDetector:
+    """import 시점엔 아무것도 하지 않고, 첫 요청에서 Detector 를 만든다.
+
+    서버리스에서는 모듈 import 가 실패하면 함수 전체가 죽으므로, 로드 오류를
+    요청 단위의 JSON 에러로 돌려주기 위해 지연 로딩한다.
+    """
+
+    def __init__(self, factory):
+        self._factory = factory
+        self._detector = None
+        self._lock = threading.Lock()
+
+    def get(self):
+        if self._detector is None:
+            with self._lock:
+                if self._detector is None:
+                    self._detector = self._factory()
+        return self._detector
+
+    def predict(self, img):
+        return self.get().predict(img)
+
+    def info(self):
+        return self.get().info()
+
+
+def resolve_checkpoint() -> str:
+    """환경변수에서 체크포인트 위치를 찾아 로컬 경로로 돌려준다 (필요하면 /tmp 로 다운로드)."""
+    local = os.environ.get("TEG_CHECKPOINT")
+    if local:
+        p = Path(local)
+        if not p.is_absolute():
+            p = ROOT / p
+        return str(p)
+
+    cache_dir = Path(os.environ.get("TEG_CACHE_DIR", "/tmp/teg"))  # 서버리스에서 쓸 수 있는 곳은 /tmp 뿐
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    repo = os.environ.get("TEG_HF_REPO")
+    if repo:
+        from huggingface_hub import hf_hub_download
+
+        return hf_hub_download(
+            repo_id=repo,
+            filename=os.environ.get("TEG_HF_FILE", "deploy.pt"),
+            repo_type=os.environ.get("TEG_HF_REPO_TYPE", "model"),
+            cache_dir=str(cache_dir),
+            token=os.environ.get("HF_TOKEN"),
+        )
+
+    url = os.environ.get("TEG_CHECKPOINT_URL")
+    if url:
+        import urllib.request
+
+        dst = cache_dir / (Path(url.split("?")[0]).name or "checkpoint.pt")
+        if not dst.exists():
+            tmp = dst.with_suffix(dst.suffix + ".part")
+            urllib.request.urlretrieve(url, tmp)
+            tmp.rename(dst)
+        return str(dst)
+
+    raise RuntimeError("TEG_CHECKPOINT / TEG_HF_REPO / TEG_CHECKPOINT_URL 중 하나를 설정하세요 "
+                       "(화면만 보려면 TEG_DEMO=1).")
+
+
+def app_from_env() -> Flask:
+    if os.environ.get("TEG_DEMO", "").lower() in ("1", "true", "yes"):
+        detector = DemoDetector()
+    else:
+        detector = LazyDetector(lambda: Detector(
+            resolve_checkpoint(), os.environ.get("TEG_MODEL"), os.environ.get("TEG_DEVICE", "cpu")))
+    flask_app = create_app(
+        detector,
+        float(os.environ.get("TEG_CLS_THRESHOLD", 0.5)),
+        float(os.environ.get("TEG_MASK_THRESHOLD", 0.5)),
+        Path(os.environ.get("TEG_EXAMPLES_DIR", ROOT / "static" / "examples")),
+    )
+    if os.environ.get("VERCEL"):
+        # Vercel Functions 는 요청 본문이 4.5MB 로 제한된다 (프론트에서 미리 줄여서 보냄).
+        flask_app.config["MAX_CONTENT_LENGTH"] = int(4.4 * 1024 * 1024)
+    return flask_app
 
 
 def parse_args():
@@ -437,6 +555,11 @@ def main():
     app = create_app(detector, args.cls_threshold, args.mask_threshold, Path(args.examples_dir))
     print(f"[app] http://{args.host}:{args.port}")
     app.run(host=args.host, port=args.port, debug=args.debug)
+
+
+# Vercel 은 이 파일을 import 해서 전역 변수 `app` (WSGI 앱) 을 찾는다.
+# (만들기만 하고 모델은 첫 요청 때 로드하므로, python app.py 로 실행할 때는 비용이 거의 없다.)
+app = app_from_env()
 
 
 if __name__ == "__main__":
